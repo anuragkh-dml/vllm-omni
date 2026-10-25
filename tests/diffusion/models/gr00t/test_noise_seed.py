@@ -23,6 +23,7 @@ from vllm_omni.diffusion.models.gr00t.configs.gr00t_n1d7 import Gr00tN1d7Config
 from vllm_omni.diffusion.models.gr00t.modeling.gr00t_n1d7 import Gr00tN1d7ActionHead
 from vllm_omni.diffusion.models.gr00t.pipeline_gr00t import Gr00tN1d7Pipeline
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -70,14 +71,14 @@ def test_runner_generator_is_passed_through_untouched(pipeline):
     """In serving the runner has already built ``sampling_params.generator``; the head must get that object."""
     generator = torch.Generator().manual_seed(99)
 
-    assert pipeline.forward(_request(generator=generator)).error is None
+    assert pipeline.forward(DiffusionRequestBatch([_request(generator=generator)]))[0].error is None
 
     assert pipeline.policy.seen_options["generator"] is generator
 
 
 def test_seed_without_generator_builds_one_on_the_pipeline_device(pipeline):
     """Callers that bypass the runner (direct use, tests) still get the seed honoured."""
-    pipeline.forward(_request(seed=1234))
+    pipeline.forward(DiffusionRequestBatch([_request(seed=1234)]))
 
     generator = pipeline.policy.seen_options["generator"]
     assert isinstance(generator, torch.Generator)
@@ -90,7 +91,7 @@ def test_auto_assigned_seed_reaches_the_head(pipeline):
     req = _request()
     assert req.sampling_params.seed is not None
 
-    pipeline.forward(req)
+    pipeline.forward(DiffusionRequestBatch([req]))
 
     assert pipeline.policy.seen_options["generator"].initial_seed() == req.sampling_params.seed
 
@@ -107,7 +108,7 @@ def test_unexpected_generator_form_warns_and_falls_back_to_the_seed(pipeline, mo
     warnings = _captured_warnings(monkeypatch)
     generators = [torch.Generator().manual_seed(1), torch.Generator().manual_seed(2)]
 
-    pipeline.forward(_request(generator=generators, seed=7))
+    pipeline.forward(DiffusionRequestBatch([_request(generator=generators, seed=7)]))
 
     assert len(warnings) == 1
     assert "torch.Generator" in warnings[0][0]
@@ -118,7 +119,7 @@ def test_unexpected_generator_form_without_a_seed_warns_and_leaves_the_global_rn
     warnings = _captured_warnings(monkeypatch)
     generators = [torch.Generator().manual_seed(1), torch.Generator().manual_seed(2)]
 
-    pipeline.forward(_request(generator=generators))
+    pipeline.forward(DiffusionRequestBatch([_request(generator=generators)]))
 
     assert len(warnings) == 1
     assert pipeline.policy.seen_options is None
@@ -175,3 +176,19 @@ def test_head_without_generator_stays_on_the_global_rng():
     torch.manual_seed(5)
 
     assert torch.equal(_predict(head, None), expected)
+
+
+def test_head_draws_each_batched_row_from_its_own_generator():
+    head = _noise_only_head(action_horizon=4, action_dim=3)
+    generators = [torch.Generator().manual_seed(5), torch.Generator().manual_seed(6)]
+    expected = torch.stack(
+        [torch.randn(4, 3, generator=torch.Generator().manual_seed(seed)) for seed in (5, 6)]
+    )
+
+    actual = _predict(head, {"generators": generators})
+
+    assert torch.equal(actual, expected)
+    swapped = _predict(head, {"generators": [torch.Generator().manual_seed(6), torch.Generator().manual_seed(5)]})
+    assert torch.equal(swapped, expected.flip(0))
+    with pytest.raises(ValueError, match="expected 2 request generators"):
+        _predict(head, {"generators": [torch.Generator().manual_seed(5)]})

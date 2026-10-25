@@ -137,9 +137,10 @@ class Gr00tN1d7ActionHead(nn.Module):
             state_features: [B, state_horizon, input_embedding_dim]
             embodiment_id: [B] (embodiment IDs)
             backbone_output: Output from the backbone model
-            options: ``generator`` (a ``torch.Generator`` on the model device) draws
-                the initial action noise; ``None`` leaves ``torch.randn`` on the
-                global RNG, as upstream Isaac-GR00T does. The ``rtc_*`` keys drive
+            options: ``generator`` draws the initial action noise for a direct
+                call. ``generators`` supplies one generator per observation in
+                a request batch. ``None`` leaves ``torch.randn`` on the global
+                RNG, as upstream Isaac-GR00T does. The ``rtc_*`` keys drive
                 real-time chunking when ``action_input`` carries a previous chunk.
         """
         vl_embeds = backbone_features
@@ -147,12 +148,32 @@ class Gr00tN1d7ActionHead(nn.Module):
         batch_size = vl_embeds.shape[0]
         device = vl_embeds.device
         generator = options.get("generator") if options else None
-        actions = torch.randn(
-            size=(batch_size, self.config.action_horizon, self.action_dim),
-            dtype=vl_embeds.dtype,
-            device=device,
-            generator=generator,
-        )
+        generators = options.get("generators") if options else None
+        if generators is not None:
+            if generator is not None:
+                raise ValueError("GR00T options cannot contain both generator and generators.")
+            if not isinstance(generators, list) or len(generators) != batch_size:
+                raise ValueError(f"GR00T expected {batch_size} request generators.")
+            if any(item is not None and not isinstance(item, torch.Generator) for item in generators):
+                raise TypeError("GR00T request generators must be torch.Generator values or None.")
+            actions = torch.stack(
+                [
+                    torch.randn(
+                        (self.config.action_horizon, self.action_dim),
+                        dtype=vl_embeds.dtype,
+                        device=device,
+                        generator=item,
+                    )
+                    for item in generators
+                ]
+            )
+        else:
+            actions = torch.randn(
+                size=(batch_size, self.config.action_horizon, self.action_dim),
+                dtype=vl_embeds.dtype,
+                device=device,
+                generator=generator,
+            )
 
         dt = 1.0 / self.num_inference_timesteps
         vel_strength = torch.ones_like(actions)

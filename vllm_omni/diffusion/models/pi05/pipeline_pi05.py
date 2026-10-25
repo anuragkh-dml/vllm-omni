@@ -2,12 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """π0.5 VLA pipeline for vllm-omni.
 
-Entry point for ``DiffusionEngine.step() → pipeline.forward(req)``. Mirrors the
-DreamZero contract and the π0 pipeline: the pipeline owns ALL preprocessing. It
-reads the raw robot observation from
-``req.sampling_params.extra_args["robot_obs"]`` (delivered by the OpenPI
-realtime serving layer), builds model inputs, runs flow-matching denoising, and
-returns ``DiffusionOutput(output={"actions": ndarray})``.
+The pipeline preprocesses each OpenPI observation, runs one flow-matching
+model call for a request batch, and returns one action output per request.
 
 π0.5 is stateless across calls (no KV reuse, first-order Markov), so
 ``session_id`` / ``reset`` from the OpenPI protocol are accepted but ignored.
@@ -24,7 +20,10 @@ from __future__ import annotations
 
 import json
 import os
+import time
+from collections.abc import Mapping
 from dataclasses import fields as dataclass_fields
+from uuid import uuid4
 
 import numpy as np
 import torch
@@ -36,7 +35,8 @@ from vllm_omni.diffusion.models.pi05.config import SUPPORTED_DTYPE_NAMES, Pi05Co
 from vllm_omni.diffusion.models.pi05.modeling_pi05 import Pi05ForActionPrediction
 from vllm_omni.diffusion.models.pi05.processor_pi05 import Pi05Processor
 from vllm_omni.diffusion.models.pi05_pipeline_config import PI05_PIPELINE as PI05_PIPELINE
-from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
@@ -51,6 +51,21 @@ SUPPORTED_DTYPES = (torch.float32, torch.bfloat16)
 # The two lists guard different entry points — what the checkpoint declares
 # versus the dtype actually cast to — so they must not drift apart.
 assert {str(dtype).split(".")[-1] for dtype in SUPPORTED_DTYPES} == set(SUPPORTED_DTYPE_NAMES)
+
+
+def _benchmark_telemetry_enabled() -> bool:
+    if os.environ.get("VLLM_OMNI_BENCH_BATCH_TELEMETRY") != "1":
+        return False
+    distributed = torch.distributed
+    return not distributed.is_available() or not distributed.is_initialized() or distributed.get_rank() == 0
+
+
+def _benchmark_request_id(observation: Mapping) -> str | None:
+    value = observation.get("benchmark_request_id")
+    if not isinstance(value, str) or not value.startswith("benchmark-"):
+        return None
+    suffix = value.removeprefix("benchmark-")
+    return value if len(suffix) == 32 and all(char in "0123456789abcdef" for char in suffix) else None
 
 
 def _checkpoint_declared_keys(model_dir: str) -> set[str]:
@@ -122,6 +137,8 @@ class Pi05Pipeline(nn.Module):
 
     Registered as ``"Pi05Pipeline"`` in the diffusion registry.
     """
+
+    supports_request_batch = True
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         super().__init__()
@@ -265,47 +282,164 @@ class Pi05Pipeline(nn.Module):
     # Inference
     # ------------------------------------------------------------------
     @torch.inference_mode()
-    def forward(self, req: OmniDiffusionRequest, **kwargs) -> DiffusionOutput:
-        extra_args = getattr(req.sampling_params, "extra_args", None) or {}
-        robot_obs = extra_args.get("robot_obs")
+    def forward(self, req: DiffusionRequestBatch, **kwargs) -> list[DiffusionOutput]:
+        del kwargs
+        outputs: list[DiffusionOutput | None] = [None] * req.num_reqs
+        valid_indices: list[int] = []
+        observations: list[Mapping] = []
+        inputs: list[tuple[list[torch.Tensor], list[torch.Tensor], torch.Tensor, torch.Tensor]] = []
+        generators: list[torch.Generator | None] = []
+        num_steps: int | None = None
 
-        if robot_obs is None:
-            # Dummy warmup path (no obs): return zeros so engine warmup/capture
-            # doesn't crash. Mirrors DreamZero's dummy-run handling.
-            first_prompt = req.prompts[0] if req.prompts else ""
-            prompt = first_prompt if isinstance(first_prompt, str) else (first_prompt.get("prompt") or "")
-            num_steps = getattr(req.sampling_params, "num_inference_steps", None)
-            if prompt == "dummy run" or num_steps == 1:
-                logger.info("Pi05Pipeline: dummy warmup request without robot_obs — returning zeros.")
-                return DiffusionOutput(
-                    output={
-                        "actions": np.zeros(
-                            (self.config.chunk_size, self.config.action_dim),
-                            dtype=np.float32,
-                        )
-                    },
+        for index, request in enumerate(req.requests):
+            sampling = request.sampling_params
+            robot_obs = (sampling.extra_args or {}).get("robot_obs")
+            if robot_obs is None:
+                prompt = request.prompt
+                if isinstance(prompt, str):
+                    prompt_text = prompt
+                elif isinstance(prompt, Mapping):
+                    prompt_text = prompt.get("prompt", "")
+                else:
+                    prompt_text = ""
+                if prompt_text == "dummy run" or sampling.num_inference_steps == 1:
+                    outputs[index] = DiffusionOutput(
+                        output={"actions": np.zeros((self.config.chunk_size, self.config.action_dim), np.float32)}
+                    )
+                else:
+                    outputs[index] = DiffusionOutput(
+                        error="Pi05Pipeline.forward requires sampling_params.extra_args['robot_obs']."
+                    )
+                continue
+
+            try:
+                if not isinstance(robot_obs, Mapping):
+                    raise TypeError("robot_obs must be a mapping")
+                steps = sampling.num_inference_steps
+                if steps is not None and (
+                    isinstance(steps, bool) or not isinstance(steps, (int, np.integer)) or int(steps) < 1
+                ):
+                    raise ValueError(f"num_inference_steps must be a positive integer, got {steps!r}.")
+                if valid_indices and (int(steps) if steps is not None else None) != num_steps:
+                    raise ValueError("num_inference_steps differs from the current request batch.")
+                model_inputs = self.processor.build_model_inputs(robot_obs)
+                generator = sampling.generator
+                if isinstance(generator, list):
+                    if len(generator) != 1:
+                        raise ValueError("π0.5 expects one generator per request.")
+                    generator = generator[0]
+                if generator is None and getattr(sampling, "seed", None) is not None:
+                    generator = torch.Generator(device=self._device).manual_seed(int(sampling.seed))
+                if generator is not None and not isinstance(generator, torch.Generator):
+                    raise TypeError("π0.5 request generator must be a torch.Generator.")
+            except Exception as exc:  # A malformed observation fails only its own request.
+                outputs[index] = DiffusionOutput.from_exception(exc)
+                continue
+
+            valid_indices.append(index)
+            observations.append(robot_obs)
+            inputs.append(model_inputs)
+            generators.append(generator)
+            num_steps = int(steps) if steps is not None else None
+
+        if valid_indices:
+            images = [
+                torch.cat([item[0][camera] for item in inputs], dim=0)
+                for camera in range(self.config.max_cameras)
+            ]
+            image_masks = [
+                torch.cat([item[1][camera] for item in inputs], dim=0) for camera in range(self.config.max_cameras)
+            ]
+            lang_tokens = torch.cat([item[2] for item in inputs], dim=0)
+            lang_masks = torch.cat([item[3] for item in inputs], dim=0)
+            model_generator = generators[0] if len(generators) == 1 else generators
+
+            telemetry_enabled = _benchmark_telemetry_enabled()
+            start_event = end_event = None
+            if telemetry_enabled and self._device.type == "cuda":
+                try:
+                    device_module = torch.get_device_module(self._device)
+                    start_event = device_module.Event(enable_timing=True)
+                    end_event = device_module.Event(enable_timing=True)
+                    start_event.record()
+                except Exception:
+                    # Benchmark instrumentation must never change inference.
+                    start_event = end_event = None
+                    logger.warning("Pi05 benchmark CUDA timing unavailable", exc_info=True)
+            forward_start_ns = time.monotonic_ns() if telemetry_enabled else 0
+            model_error: BaseException | None = None
+            try:
+                actions = self.model.sample_actions(
+                    images=images,
+                    image_masks=image_masks,
+                    lang_tokens=lang_tokens,
+                    lang_masks=lang_masks,
+                    num_steps=num_steps,
+                    generator=model_generator,
                 )
-            return DiffusionOutput(
-                error="Pi05Pipeline.forward requires sampling_params.extra_args['robot_obs'].",
-            )
+            except BaseException as exc:
+                model_error = exc
+                raise
+            finally:
+                if telemetry_enabled:
+                    forward_end_ns = time.monotonic_ns()
+                    try:
+                        cuda_event_ms = None
+                        cuda_sync_overhead_ms = None
+                        if start_event is not None and end_event is not None:
+                            end_event.record()
+                            sync_start_ns = time.monotonic_ns()
+                            end_event.synchronize()
+                            cuda_event_ms = start_event.elapsed_time(end_event)
+                            cuda_sync_overhead_ms = (time.monotonic_ns() - sync_start_ns) / 1e6
+                        peak_reserved_mb = (
+                            current_omni_platform.max_memory_reserved() / (1024**2)
+                            if self._device.type == "cuda" else None
+                        )
+                    except Exception:
+                        cuda_event_ms = cuda_sync_overhead_ms = peak_reserved_mb = None
+                        logger.warning("Pi05 benchmark device metrics unavailable", exc_info=True)
+                    try:
+                        od_config = getattr(self, "od_config", None)
+                        event = {
+                            "schema": "vllm_omni.pi05.sample_actions.v1",
+                            "batch_id": uuid4().hex,
+                            "benchmark_request_ids": [
+                                _benchmark_request_id(observation) for observation in observations
+                            ],
+                            "engine_request_ids": [req.requests[index].request_id for index in valid_indices],
+                            "session_ids": [observation.get("session_id") for observation in observations],
+                            "executed_batch_size": len(valid_indices),
+                            "configured_max_num_seqs": getattr(od_config, "max_num_seqs", None),
+                            "configured_request_batch_max_wait_ms": getattr(
+                                od_config, "request_batch_max_wait_ms", None
+                            ),
+                            "scheduler_queue_wait_ms": [
+                                req.requests[index].scheduler_queue_wait_ms for index in valid_indices
+                            ],
+                            "forward_start_ns": forward_start_ns,
+                            "forward_end_ns": forward_end_ns,
+                            "cpu_forward_ms": (forward_end_ns - forward_start_ns) / 1e6,
+                            "cuda_event_ms": cuda_event_ms,
+                            "cuda_sync_overhead_ms": cuda_sync_overhead_ms,
+                            "peak_reserved_mb": peak_reserved_mb,
+                            "status": "completed" if model_error is None else "failed",
+                            "error_type": type(model_error).__name__ if model_error is not None else None,
+                        }
+                        logger.info("BENCH_PI05_FORWARD %s", json.dumps(event, separators=(",", ":")))
+                    except Exception:
+                        logger.warning("Pi05 benchmark telemetry emission failed", exc_info=True)
+            expected_shape = (len(valid_indices), self.config.chunk_size, self.config.max_action_dim)
+            if tuple(actions.shape) != expected_shape:
+                raise RuntimeError(
+                    f"π0.5 model returned actions with shape {tuple(actions.shape)}, expected {expected_shape}."
+                )
+            for row, index in enumerate(valid_indices):
+                try:
+                    action = self.processor.build_model_outputs(actions[row : row + 1], observations[row])
+                    outputs[index] = DiffusionOutput(output={"actions": action})
+                except Exception as exc:  # Postprocessing uses this request's state.
+                    outputs[index] = DiffusionOutput.from_exception(exc)
 
-        images, image_masks, lang_tokens, lang_masks = self.processor.build_model_inputs(robot_obs)
-
-        num_steps = getattr(req.sampling_params, "num_inference_steps", None)
-        if num_steps is not None and (
-            isinstance(num_steps, bool) or not isinstance(num_steps, (int, np.integer)) or int(num_steps) < 1
-        ):
-            raise ValueError(f"num_inference_steps must be a positive integer, got {num_steps!r}.")
-        if num_steps is not None:
-            num_steps = int(num_steps)
-
-        actions = self.model.sample_actions(
-            images=images,
-            image_masks=image_masks,
-            lang_tokens=lang_tokens,
-            lang_masks=lang_masks,
-            num_steps=num_steps,
-            generator=req.sampling_params.generator,
-        )
-
-        return DiffusionOutput(output={"actions": self.processor.build_model_outputs(actions, robot_obs)})
+        assert all(output is not None for output in outputs)
+        return [output for output in outputs if output is not None]

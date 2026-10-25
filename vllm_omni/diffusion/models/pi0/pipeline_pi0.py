@@ -2,12 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """π0 (Pi-Zero) VLA pipeline for vllm-omni.
 
-Entry point for ``DiffusionEngine.step() → pipeline.forward(req)``. Mirrors the
-DreamZero contract: the pipeline owns ALL preprocessing. It reads the raw robot
-observation from ``req.sampling_params.extra_args["robot_obs"]`` (delivered by
-the OpenPI realtime serving layer), builds model inputs, runs flow-matching
-denoising, and returns ``DiffusionOutput(output={"actions": ndarray})`` — which
-``diffusion_engine`` promotes to ``multimodal_output["actions"]`` for the client.
+The pipeline owns preprocessing for each OpenPI observation. A request batch
+becomes one flow-matching model call and one action output per request.
 
 π0 is stateless across calls (no KV reuse), so ``session_id`` / ``reset`` from
 the OpenPI protocol are accepted but ignored.
@@ -16,6 +12,7 @@ the OpenPI protocol are accepted but ignored.
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 
 import numpy as np
 import torch
@@ -27,7 +24,7 @@ from vllm_omni.diffusion.models.pi0.config import Pi0Config
 from vllm_omni.diffusion.models.pi0.modeling_pi0 import Pi0ForActionPrediction
 from vllm_omni.diffusion.models.pi0.processor_pi0 import build_model_inputs
 from vllm_omni.diffusion.models.pi0_pipeline_config import PI0_PIPELINE as PI0_PIPELINE
-from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 logger = init_logger(__name__)
 
@@ -57,6 +54,8 @@ class Pi0Pipeline(nn.Module):
     self-loaded in ``__init__`` from the checkpoint's ``model.safetensors`` via
     the kernel's ``load_weights`` (which handles the LeRobot key remaps).
     """
+
+    supports_request_batch = True
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         super().__init__()
@@ -188,60 +187,109 @@ class Pi0Pipeline(nn.Module):
     # Inference
     # ------------------------------------------------------------------
     @torch.inference_mode()
-    def forward(self, req: OmniDiffusionRequest, **kwargs) -> DiffusionOutput:
-        extra_args = getattr(req.sampling_params, "extra_args", None) or {}
-        robot_obs = extra_args.get("robot_obs")
+    def forward(self, req: DiffusionRequestBatch, **kwargs) -> list[DiffusionOutput]:
+        del kwargs
+        outputs: list[DiffusionOutput | None] = [None] * req.num_reqs
+        valid_indices: list[int] = []
+        inputs: list[tuple[list[torch.Tensor], list[torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]] = []
+        noise_rows: list[torch.Tensor] = []
+        num_steps: int | None = None
 
-        if robot_obs is None:
-            # Dummy warmup path (no obs): return zeros so engine warmup/capture
-            # doesn't crash. Mirrors DreamZero's dummy-run handling.
-            first_prompt = req.prompts[0] if req.prompts else ""
-            prompt = first_prompt if isinstance(first_prompt, str) else (first_prompt.get("prompt") or "")
-            num_steps = getattr(req.sampling_params, "num_inference_steps", None)
-            if prompt == "dummy run" or num_steps == 1:
-                logger.info("Pi0Pipeline: dummy warmup request without robot_obs — returning zeros.")
-                return DiffusionOutput(
-                    output={
-                        "actions": np.zeros(
-                            (self.config.chunk_size, self.config.max_action_dim),
-                            dtype=np.float32,
-                        )
-                    },
-                )
-            return DiffusionOutput(
-                error="Pi0Pipeline.forward requires sampling_params.extra_args['robot_obs'].",
+        for index, request in enumerate(req.requests):
+            sampling = request.sampling_params
+            extra_args = sampling.extra_args or {}
+            robot_obs = extra_args.get("robot_obs")
+            if robot_obs is None:
+                prompt = request.prompt
+                if isinstance(prompt, str):
+                    prompt_text = prompt
+                elif isinstance(prompt, Mapping):
+                    prompt_text = prompt.get("prompt", "")
+                else:
+                    prompt_text = ""
+                if prompt_text == "dummy run" or sampling.num_inference_steps == 1:
+                    outputs[index] = DiffusionOutput(
+                        output={"actions": np.zeros((self.config.chunk_size, self.config.max_action_dim), np.float32)}
+                    )
+                else:
+                    outputs[index] = DiffusionOutput(
+                        error="Pi0Pipeline.forward requires sampling_params.extra_args['robot_obs']."
+                    )
+                continue
+
+            try:
+                if not isinstance(robot_obs, Mapping):
+                    raise TypeError("robot_obs must be a mapping")
+                steps = sampling.num_inference_steps
+                if steps is not None and (
+                    isinstance(steps, bool) or not isinstance(steps, (int, np.integer)) or steps < 1
+                ):
+                    raise ValueError(f"num_inference_steps must be a positive integer, got {steps!r}.")
+                if valid_indices and (int(steps) if steps is not None else None) != num_steps:
+                    raise ValueError("num_inference_steps differs from the current request batch.")
+                model_inputs = build_model_inputs(robot_obs, self.config, self.tokenizer, self._device)
+                generator = sampling.generator
+                if isinstance(generator, list):
+                    if len(generator) != 1:
+                        raise ValueError("π0 expects one generator per request.")
+                    generator = generator[0]
+                if generator is None and sampling.seed is not None:
+                    generator = torch.Generator(device=self._device).manual_seed(int(sampling.seed))
+                if generator is not None and not isinstance(generator, torch.Generator):
+                    raise TypeError("π0 request generator must be a torch.Generator.")
+                noise = extra_args.get("noise")
+                if noise is None:
+                    noise_row = torch.randn(
+                        (self.config.chunk_size, self.config.max_action_dim),
+                        dtype=torch.float32,
+                        device=self._device,
+                        generator=generator,
+                    )
+                else:
+                    noise_row = torch.as_tensor(noise, dtype=torch.float32, device=self._device)
+                    if noise_row.ndim == 3 and noise_row.shape[0] == 1:
+                        noise_row = noise_row[0]
+                    expected = (self.config.chunk_size, self.config.max_action_dim)
+                    if tuple(noise_row.shape) != expected:
+                        raise ValueError(f"π0 request noise must have shape {expected}, got {tuple(noise_row.shape)}.")
+            except Exception as exc:  # A malformed observation fails only its own request.
+                outputs[index] = DiffusionOutput.from_exception(exc)
+                continue
+
+            valid_indices.append(index)
+            inputs.append(model_inputs)
+            noise_rows.append(noise_row)
+            num_steps = int(steps) if steps is not None else None
+
+        if valid_indices:
+            images = [
+                torch.cat([item[0][camera] for item in inputs], dim=0)
+                for camera in range(self.config.max_cameras)
+            ]
+            image_masks = [
+                torch.cat([item[1][camera] for item in inputs], dim=0) for camera in range(self.config.max_cameras)
+            ]
+            lang_tokens = torch.cat([item[2] for item in inputs], dim=0)
+            lang_masks = torch.cat([item[3] for item in inputs], dim=0)
+            state = self.model._normalize_state(torch.cat([item[4] for item in inputs], dim=0))
+
+            actions = self.model.sample_actions(
+                images=images,
+                image_masks=image_masks,
+                lang_tokens=lang_tokens,
+                lang_masks=lang_masks,
+                state=state,
+                noise=torch.stack(noise_rows),
+                num_steps=num_steps,
             )
+            actions = self.model._unnormalize_actions(actions)
+            expected_shape = (len(valid_indices), self.config.chunk_size, self.config.max_action_dim)
+            if tuple(actions.shape) != expected_shape:
+                raise RuntimeError(
+                    f"π0 model returned actions with shape {tuple(actions.shape)}, expected {expected_shape}."
+                )
+            for row, index in enumerate(valid_indices):
+                outputs[index] = DiffusionOutput(output={"actions": actions[row].float().cpu().numpy()})
 
-        images, image_masks, lang_tokens, lang_masks, state = build_model_inputs(
-            robot_obs, self.config, self.tokenizer, self._device
-        )
-
-        # State normalization (identity for pi0_base) inside the model.
-        state = self.model._normalize_state(state)
-
-        noise = extra_args.get("noise")
-        if noise is not None and not isinstance(noise, torch.Tensor):
-            noise = torch.as_tensor(noise, dtype=torch.float32, device=self._device)
-        elif isinstance(noise, torch.Tensor):
-            noise = noise.to(device=self._device, dtype=torch.float32)
-
-        num_steps = extra_args.get("num_inference_steps")
-
-        actions = self.model.sample_actions(
-            images=images,
-            image_masks=image_masks,
-            lang_tokens=lang_tokens,
-            lang_masks=lang_masks,
-            state=state,
-            noise=noise,
-            num_steps=num_steps,
-        )
-        actions = self.model._unnormalize_actions(actions)
-
-        # (B=1, horizon, action_dim) → (horizon, action_dim) numpy for the wire.
-        actions_np = actions.squeeze(0).float().cpu().numpy()
-
-        # Note: post-processing is applied engine-side via the registry
-        # (_DIFFUSION_POST_PROCESS_FUNCS), so we don't attach it here (a local
-        # closure wouldn't survive the orchestrator's multiprocess pickling).
-        return DiffusionOutput(output={"actions": actions_np})
+        assert all(output is not None for output in outputs)
+        return [output for output in outputs if output is not None]

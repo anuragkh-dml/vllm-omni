@@ -1,5 +1,6 @@
-# π0.5 VLA: one diffusion stage, one GPU, eager, bsz 1 (OpenPI policy serving is
-# one observation -> one action reply). Every key below is documented in
+# π0.5 VLA: one diffusion stage, one GPU, eager, max_num_seqs 1 by default.
+# A copied config can opt into batching while each observation gets its own reply.
+# Every key below is documented in
 # recipes/lerobot/Pi05.md.
 
 pipeline: pi05

@@ -60,6 +60,14 @@ The deploy config (`vllm_omni/deploy/pi0.yaml`) declares a single diffusion stag
 handshake metadata (3 cameras, `joint_position`, action horizon 50, action dim
 32) that enables the OpenPI realtime serving layer.
 
+To batch observations from separate clients, copy the deploy YAML and set
+`stages[0].max_num_seqs: 4` and `stages[0].request_batch_max_wait_ms: 10`.
+These are example B and T values; tune B for GPU memory and T for the robot's
+control-loop budget. A full batch dispatches early, and a partial batch may
+dispatch before T when arrivals stabilize. Keep `step_execution: false` and
+pass the copied file to `--deploy-config`. The shipped B=1 default remains a
+safe starting point.
+
 #### Verification
 
 Run the example client (sends a synthetic observation and prints the returned

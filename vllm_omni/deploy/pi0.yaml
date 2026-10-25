@@ -6,9 +6,10 @@
 # Actions are exposed through the OpenPI realtime serving API
 # (/v1/realtime/robot/openpi); they ride in multimodal_output["actions"].
 #
-# Default: one GPU, TP=1, eager (flow matching needs no CUDA graph), bsz 1
-# (OpenPI policy serving is one observation -> one action reply). float32 to
-# match the LeRobot pi0_base reference numerics.
+# Default: one GPU, TP=1, eager (flow matching needs no CUDA graph), and
+# max_num_seqs 1. A copied config can opt into request batching while every
+# OpenPI message still gets its own action reply. float32 matches the LeRobot
+# pi0_base reference numerics.
 
 pipeline: pi0
 async_chunk: false

@@ -23,7 +23,9 @@ behaviour still produces a well-shaped, finite action chunk:
 
 from __future__ import annotations
 
+import json
 import logging
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -57,6 +59,9 @@ from vllm_omni.diffusion.models.pi05.processor_pi05 import (
     discretize_state,
     resize_with_pad,
 )
+from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -352,7 +357,7 @@ class _WideActionModel:
         return torch.ones(self._shape)
 
 
-def test_pipeline_crops_actions_to_checkpoint_output_schema(monkeypatch):
+def test_pipeline_crops_actions_to_checkpoint_output_schema():
     from vllm_omni.diffusion.models.pi05 import pipeline_pi05
     from vllm_omni.diffusion.request import OmniDiffusionRequest
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -362,24 +367,24 @@ def test_pipeline_crops_actions_to_checkpoint_output_schema(monkeypatch):
     )
     pipeline = object.__new__(pipeline_pi05.Pi05Pipeline)
     pipeline.config = config
-    pipeline.tokenizer = object()
+    pipeline.tokenizer = _FakeTokenizer()
     pipeline._device = torch.device("cpu")
-    pipeline.processor = Pi05Processor(config, object(), torch.device("cpu"))
+    pipeline.processor = Pi05Processor(config, _FakeTokenizer(), torch.device("cpu"))
     pipeline.model = _WideActionModel(config.chunk_size, config.max_action_dim)
-    monkeypatch.setattr(
-        pipeline.processor,
-        "build_model_inputs",
-        lambda robot_obs: ([torch.empty(0)], [torch.empty(0)], torch.empty(0), torch.empty(0)),
-    )
     request = OmniDiffusionRequest(
         prompt="",
         sampling_params=OmniDiffusionSamplingParams(
-            extra_args={"robot_obs": {"state": np.zeros(config.max_state_dim)}},
+            extra_args={
+                "robot_obs": {
+                    "state": np.zeros(config.max_state_dim),
+                    "images": {_EXPECTED_CAMERA_ORDER[0]: np.zeros((4, 4, 3), dtype=np.uint8)},
+                }
+            },
         ),
         request_id="crop-test",
     )
 
-    result = pipeline.forward(request)
+    result = pipeline.forward(DiffusionRequestBatch([request]))[0]
 
     assert result.output["actions"].shape == (config.chunk_size, 7)
 
@@ -1075,6 +1080,8 @@ def _spy_request(num_inference_steps, generator=None):
     params.num_inference_steps = num_inference_steps
     params.generator = generator
     request = type("_Request", (), {})()
+    request.prompt = ""
+    request.request_id = "spy"
     request.sampling_params = params
     return request
 
@@ -1084,7 +1091,7 @@ def test_request_denoising_steps_reach_sample_actions(requested):
     """The OpenPI E2E cannot see this: a pipeline that ignored the override and
     ran the static default would still return a finite chunk of the right shape."""
     spy = _SpyModel()
-    output = _spy_pipeline(spy).forward(_spy_request(requested))
+    output = _spy_pipeline(spy).forward(DiffusionRequestBatch([_spy_request(requested)]))[0]
 
     assert spy.seen == [requested]
     assert output.output["actions"].shape == (50, 32)
@@ -1094,7 +1101,7 @@ def test_request_generator_reaches_sample_actions():
     generator = torch.Generator().manual_seed(42)
     spy = _SpyModel()
 
-    _spy_pipeline(spy).forward(_spy_request(2, generator))
+    _spy_pipeline(spy).forward(DiffusionRequestBatch([_spy_request(2, generator)]))
 
     assert spy.generators == [generator]
 
@@ -1102,6 +1109,172 @@ def test_request_generator_reaches_sample_actions():
 @pytest.mark.parametrize("bad", [0, -1, 2.5, True, "4"])
 def test_request_denoising_steps_must_be_a_positive_integer(bad):
     spy = _SpyModel()
-    with pytest.raises(ValueError, match="num_inference_steps must be a positive integer"):
-        _spy_pipeline(spy).forward(_spy_request(bad))
+    output = _spy_pipeline(spy).forward(DiffusionRequestBatch([_spy_request(bad)]))[0]
+    assert "num_inference_steps must be a positive integer" in output.error
     assert spy.seen == []
+
+
+class _BatchPi05Tokenizer:
+    def __call__(self, text, **kwargs):
+        length = kwargs["max_length"]
+        ids = [sum(map(ord, text)) % 1000] + [0] * (length - 1)
+        return {"input_ids": ids, "attention_mask": [1] + [0] * (length - 1)}
+
+
+class _BatchRecordingPi05Model:
+    def __init__(self):
+        self.calls = []
+
+    def sample_actions(self, *, images, image_masks, lang_tokens, lang_masks, num_steps, generator):
+        self.calls.append((images, image_masks, lang_tokens, lang_masks, num_steps, generator))
+        generators = generator if isinstance(generator, list) else [generator] * lang_tokens.shape[0]
+        noise = torch.stack([torch.randn((50, 32), generator=item) for item in generators])
+        return noise + images[0].mean(dim=(1, 2, 3))[:, None, None]
+
+
+def _batch_pi05_pipeline():
+    from vllm_omni.diffusion.models.pi05.pipeline_pi05 import Pi05Pipeline
+
+    pipeline = object.__new__(Pi05Pipeline)
+    pipeline.config = Pi05Config.from_model_config(
+        {**_LEROBOT_CFG, "image_resolution": [4, 4], "use_relative_actions": True, "relative_exclude_joints": []}
+    )
+    pipeline.tokenizer = _BatchPi05Tokenizer()
+    pipeline._device = torch.device("cpu")
+    pipeline.processor = Pi05Processor(pipeline.config, pipeline.tokenizer, pipeline._device)
+    pipeline.model = _BatchRecordingPi05Model()
+    return pipeline
+
+
+def _batch_pi05_request(index, *, valid=True):
+    observation = {
+        "images": {_EXPECTED_CAMERA_ORDER[0]: np.full((4, 4, 3), 20 + index * 30, dtype=np.uint8)},
+        "state": np.full(32, index + 1, dtype=np.float32),
+        "prompt": f"task {index}",
+    }
+    if not valid:
+        observation["images"] = {}
+    return OmniDiffusionRequest(
+        prompt=observation["prompt"],
+        request_id=f"pi05-{index}",
+        sampling_params=OmniDiffusionSamplingParams(
+            seed=200 + index,
+            num_inference_steps=3,
+            extra_args={"robot_obs": observation},
+        ),
+    )
+
+
+@pytest.mark.parametrize("batch_size", [1, 2, 4])
+def test_pi05_batch_fuses_requests_and_uses_each_clients_state(batch_size):
+    requests = [_batch_pi05_request(i) for i in range(batch_size)]
+    pipeline = _batch_pi05_pipeline()
+
+    results = pipeline.forward(DiffusionRequestBatch(requests))
+
+    assert len(pipeline.model.calls) == 1
+    images, masks, tokens, token_masks, steps, generators = pipeline.model.calls[0]
+    assert images[0].shape[0] == masks[0].shape[0] == tokens.shape[0] == batch_size
+    assert token_masks.shape[0] == batch_size and steps == 3
+    if batch_size == 1:
+        assert isinstance(generators, torch.Generator)
+    else:
+        assert isinstance(generators, list) and len(generators) == batch_size
+    assert all(not mask.any() for mask in masks[1:])
+    assert len(results) == batch_size
+    for index, request in enumerate(requests):
+        assert results[index].error is None
+        action = results[index].output["actions"]
+        assert action.shape == (50, 32) and action.dtype == np.float32
+        expected_noise = torch.randn((50, 32), generator=torch.Generator().manual_seed(200 + index))
+        expected = expected_noise + images[0][index].mean() + (index + 1)
+        np.testing.assert_allclose(action, expected.numpy(), rtol=0, atol=1e-6)
+        solo = _batch_pi05_pipeline().forward(DiffusionRequestBatch([request]))[0]
+        np.testing.assert_array_equal(action, solo.output["actions"])
+
+    reversed_results = _batch_pi05_pipeline().forward(DiffusionRequestBatch(list(reversed(requests))))
+    for original, reversed_output in zip(reversed(results), reversed_results):
+        np.testing.assert_array_equal(original.output["actions"], reversed_output.output["actions"])
+
+
+def test_pi05_invalid_peer_keeps_valid_relative_action():
+    good = _batch_pi05_request(1)
+    pipeline = _batch_pi05_pipeline()
+    results = pipeline.forward(DiffusionRequestBatch([_batch_pi05_request(0, valid=False), good]))
+
+    assert results[0].error is not None
+    assert results[1].error is None
+    assert pipeline.model.calls[0][0][0].shape[0] == 1
+    solo = _batch_pi05_pipeline().forward(DiffusionRequestBatch([good]))[0]
+    np.testing.assert_array_equal(results[1].output["actions"], solo.output["actions"])
+
+
+def test_pi05_benchmark_telemetry_names_only_executed_rows(monkeypatch):
+    from vllm_omni.diffusion.models.pi05 import pipeline_pi05
+
+    monkeypatch.setenv("VLLM_OMNI_BENCH_BATCH_TELEMETRY", "1")
+    records = []
+    monkeypatch.setattr(pipeline_pi05.logger, "info", lambda fmt, payload: records.append((fmt, payload)))
+    pipeline = _batch_pi05_pipeline()
+    pipeline.od_config = SimpleNamespace(max_num_seqs=4, request_batch_max_wait_ms=10.0)
+    requests = [_batch_pi05_request(index, valid=index != 0) for index in range(3)]
+    for index, request in enumerate(requests):
+        obs = request.sampling_params.extra_args["robot_obs"]
+        obs["benchmark_request_id"] = f"benchmark-{index:032x}"
+        obs["session_id"] = f"session-{index}"
+        request.scheduler_queue_wait_ms = index + 0.25
+
+    outputs = pipeline.forward(DiffusionRequestBatch(requests))
+
+    assert outputs[0].error is not None
+    assert all(output.error is None for output in outputs[1:])
+    assert len(pipeline.model.calls) == 1
+    assert len(records) == 1 and records[0][0] == "BENCH_PI05_FORWARD %s"
+    event = json.loads(records[0][1])
+    assert event["executed_batch_size"] == pipeline.model.calls[0][0][0].shape[0] == 2
+    assert event["benchmark_request_ids"] == [f"benchmark-{index:032x}" for index in (1, 2)]
+    assert event["engine_request_ids"] == ["pi05-1", "pi05-2"]
+    assert event["session_ids"] == ["session-1", "session-2"]
+    assert event["scheduler_queue_wait_ms"] == [1.25, 2.25]
+    assert event["configured_max_num_seqs"] == 4
+    assert event["configured_request_batch_max_wait_ms"] == 10.0
+    assert event["status"] == "completed"
+    assert event["cuda_event_ms"] is None and event["cuda_sync_overhead_ms"] is None
+    assert 0 < event["forward_start_ns"] < event["forward_end_ns"]
+    assert "actions" not in event and "state" not in event and "prompt" not in event
+
+
+def test_pi05_benchmark_telemetry_logs_failed_model_call(monkeypatch):
+    from vllm_omni.diffusion.models.pi05 import pipeline_pi05
+
+    monkeypatch.setenv("VLLM_OMNI_BENCH_BATCH_TELEMETRY", "1")
+    records = []
+    monkeypatch.setattr(pipeline_pi05.logger, "info", lambda fmt, payload: records.append(json.loads(payload)))
+
+    class FailingModel:
+        def sample_actions(self, **kwargs):
+            raise RuntimeError("model failed")
+
+    pipeline = _batch_pi05_pipeline()
+    pipeline.od_config = SimpleNamespace(max_num_seqs=1, request_batch_max_wait_ms=5.0)
+    pipeline.model = FailingModel()
+    request = _batch_pi05_request(0)
+    request.sampling_params.extra_args["robot_obs"]["benchmark_request_id"] = "benchmark-" + "a" * 32
+    with pytest.raises(RuntimeError, match="model failed"):
+        pipeline.forward(DiffusionRequestBatch([request]))
+    assert len(records) == 1
+    assert records[0]["status"] == "failed"
+    assert records[0]["error_type"] == "RuntimeError"
+    assert records[0]["executed_batch_size"] == 1
+
+
+def test_pi05_different_denoising_steps_do_not_share_a_forward():
+    first, second = _batch_pi05_request(0), _batch_pi05_request(1)
+    second.sampling_params.num_inference_steps = 4
+    pipeline = _batch_pi05_pipeline()
+
+    results = pipeline.forward(DiffusionRequestBatch([first, second]))
+
+    assert results[0].error is None
+    assert "num_inference_steps differs" in results[1].error
+    assert pipeline.model.calls[0][0][0].shape[0] == 1

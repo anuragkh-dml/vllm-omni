@@ -693,7 +693,7 @@ class Pi05ForActionPrediction(nn.Module):
         lang_masks: torch.Tensor,
         noise: torch.Tensor | None = None,
         num_steps: int | None = None,
-        generator: torch.Generator | list[torch.Generator] | None = None,
+        generator: torch.Generator | list[torch.Generator | None] | None = None,
     ) -> torch.Tensor:
         """Generate an action chunk via iterative flow-matching denoising.
 

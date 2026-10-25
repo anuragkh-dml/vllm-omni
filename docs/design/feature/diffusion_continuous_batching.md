@@ -98,9 +98,12 @@ Its `forward()` method must accept `DiffusionRequestBatch` and return one
 `DiffusionOutput` per request. The runner validates the result count and maps
 outputs back to their original request IDs with `BatchRunnerOutput`.
 
-Current in-tree request-batch implementations include the Flux, LTX-2, SD3, and
-Qwen-Image pipelines. Treat the pipeline capability flag in the source as
-authoritative because support continues to expand.
+Current in-tree request-batch implementations include the Flux, LTX-2, SD3,
+Qwen-Image, π0, π0.5, and GR00T N1.7 pipelines. The three robot policies fuse
+independent OpenPI observations, keep request-local noise generators, and
+return one action dictionary or array per request. Treat the pipeline
+capability flag in the source as authoritative because support continues to
+expand.
 
 ### Request-Batch Data Flow
 

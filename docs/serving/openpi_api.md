@@ -28,6 +28,31 @@ policy_server_config:
 Without this configuration, the WebSocket returns `Robot policy not available`
 and closes.
 
+## Batching π0, π0.5, and GR00T
+
+These three policy pipelines can fuse observations from different clients into
+one model call on the same replica. Copy the model's deploy YAML and set the
+first stage to, for example:
+
+```yaml
+stages:
+  - stage_id: 0
+    max_num_seqs: 4                 # B: maximum observations in a model call
+    request_batch_max_wait_ms: 10  # T: maximum idle admission wait, in ms
+```
+
+Keep the rest of the copied stage configuration and serve with
+`--deploy-config /path/to/copied.yaml`. Each WebSocket message still carries
+one observation and receives one action response. A full wave can dispatch
+immediately. A partial wave can dispatch before T after arrivals stabilize;
+it never waits for another client indefinitely. T applies to admission on an
+idle replica, so total response latency also includes queueing and model
+execution. `request_batch_max_wait_ms: 0` disables the admission delay.
+Batching increases GPU memory use; choose B and T against the robot's
+control-loop latency budget using measurements on the target checkpoint and
+GPU. Leave `step_execution: false` for these pipelines. The shipped configs
+remain at `max_num_seqs: 1` until a safe value is established per deployment.
+
 ### Multi-stage policies
 
 A policy can run as several stages, for example an autoregressive stage that
@@ -120,11 +145,11 @@ frames are not observation messages.
   normally keyed by `session_id`; the API layer forwards the raw observation
   dictionary.
 - An optional integer `seed` in an inference message becomes the engine
-  request's `sampling_params.seed`. A policy whose sampling consumes the
-  request generator (GR00T-N1.7) returns the same action chunk for the same
-  observation and seed. If omitted, the engine assigns a random per-request
-  seed, so unseeded inferences are independent of each other. The API layer
-  consumes `seed`; it is not forwarded inside the observation.
+  request's `sampling_params.seed`. π0, π0.5, and GR00T N1.7 use it for
+  request-local initial action noise, so the same observation and seed
+  reproduce the same action chunk. If omitted, the engine assigns a random
+  per-request seed, so unseeded inferences are independent of each other. The
+  API layer consumes `seed`; it is not forwarded inside the observation.
 
 ## Limits and Errors
 

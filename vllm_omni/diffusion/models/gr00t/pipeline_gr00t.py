@@ -38,6 +38,8 @@ class Gr00tN1d7Pipeline(nn.Module):
     its action chunk.
     """
 
+    supports_request_batch = True
+
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
         super().__init__()
         model_config = od_config.model_config
@@ -114,29 +116,108 @@ class Gr00tN1d7Pipeline(nn.Module):
         return actions
 
     @torch.inference_mode()
-    def forward(self, req: DiffusionRequestBatch, **kwargs) -> DiffusionOutput:
+    def forward(self, req: DiffusionRequestBatch, **kwargs) -> list[DiffusionOutput]:
         del kwargs
-        extra_args = req.sampling_params.extra_args or {}
-        robot_obs = extra_args.get("robot_obs")
-        if robot_obs is None:
-            if req.request_id == DUMMY_DIFFUSION_REQUEST_ID:
-                return DiffusionOutput(output={"actions": self._dummy_actions()})
-            return DiffusionOutput(error="Gr00tN1d7Pipeline.forward expects sampling_params.extra_args['robot_obs'].")
-        if not isinstance(robot_obs, Mapping):
-            return DiffusionOutput(error=f"robot_obs must be a dict, got {type(robot_obs).__name__}.")
+        outputs: list[DiffusionOutput | None] = [None] * req.num_reqs
+        valid_indices: list[int] = []
+        observations: list[dict[str, Any]] = []
+        generators: list[torch.Generator | None] = []
+        signature: tuple[Any, ...] | None = None
 
-        if extra_args.get("reset"):
-            self.reset()
+        for index, request in enumerate(req.requests):
+            sampling = request.sampling_params
+            extra_args = sampling.extra_args or {}
+            robot_obs = extra_args.get("robot_obs")
+            if robot_obs is None:
+                if request.request_id == DUMMY_DIFFUSION_REQUEST_ID:
+                    outputs[index] = DiffusionOutput(output={"actions": self._dummy_actions()})
+                else:
+                    outputs[index] = DiffusionOutput(
+                        error="Gr00tN1d7Pipeline.forward expects sampling_params.extra_args['robot_obs']."
+                    )
+                continue
 
-        policy_obs = _normalize_observation(robot_obs, language_key=self.policy.language_key)
-        generator = _noise_generator(req.sampling_params, self.device)
-        result = self.policy.get_action(policy_obs, {"generator": generator} if generator is not None else None)
-        actions = result[0] if isinstance(result, tuple) else result
-        if not isinstance(actions, Mapping):
-            return DiffusionOutput(error=f"GR00T policy returned {type(actions).__name__}; expected dict actions.")
-        # Return actions via output.output (like the DreamZero OpenPI policy) so the engine's
-        # empty-output guard passes.
-        return DiffusionOutput(output={"actions": _to_float32_action_dict(actions)})
+            try:
+                if not isinstance(robot_obs, Mapping):
+                    raise TypeError(f"robot_obs must be a dict, got {type(robot_obs).__name__}.")
+                policy_obs = _normalize_observation(robot_obs, language_key=self.policy.language_key)
+                row_signature = _single_observation_signature(policy_obs)
+                if self.strict:
+                    self.policy.check_observation(policy_obs)
+                if signature is not None and row_signature != signature:
+                    raise ValueError("GR00T observation modalities or shapes differ from the current batch.")
+                generator = _noise_generator(sampling, self.device)
+            except Exception as exc:  # A malformed observation fails only its own request.
+                outputs[index] = DiffusionOutput.from_exception(exc)
+                continue
+
+            if extra_args.get("reset"):
+                self.reset()
+            signature = row_signature
+            valid_indices.append(index)
+            observations.append(policy_obs)
+            generators.append(generator)
+
+        if valid_indices:
+            policy_obs = _collate_observations(observations)
+            if len(generators) > 1:
+                options = {"generators": generators}
+            elif generators[0] is not None:
+                options = {"generator": generators[0]}
+            else:
+                options = None
+            result = self.policy.get_action(policy_obs, options)
+            actions = result[0] if isinstance(result, tuple) else result
+            if not isinstance(actions, Mapping):
+                raise TypeError(f"GR00T policy returned {type(actions).__name__}; expected dict actions.")
+            converted = _to_float32_action_dict(actions)
+            for key, value in converted.items():
+                if value.ndim != 3 or value.shape[0] != len(valid_indices):
+                    raise ValueError(
+                        f"GR00T action {key!r} has shape {value.shape}; expected one row per valid request."
+                    )
+            for row, index in enumerate(valid_indices):
+                outputs[index] = DiffusionOutput(
+                    output={"actions": {key: value[row : row + 1] for key, value in converted.items()}}
+                )
+
+        assert all(output is not None for output in outputs)
+        return [output for output in outputs if output is not None]
+
+
+def _single_observation_signature(observation: Mapping[str, Any]) -> tuple[Any, ...]:
+    """Check one GR00T wire observation and describe its batchable structure."""
+    signature: list[Any] = []
+    for modality, ndim in (("video", 5), ("state", 3)):
+        values = observation.get(modality)
+        if not isinstance(values, Mapping) or not values:
+            raise ValueError(f"GR00T observation requires nonempty {modality!r} data.")
+        for key, value in sorted(values.items()):
+            if not isinstance(value, np.ndarray) or value.ndim != ndim or value.shape[0] != 1:
+                raise ValueError(f"GR00T {modality}.{key} must have one leading batch row and {ndim} dimensions.")
+            signature.append((modality, key, value.shape[1:], value.dtype.str))
+    language = observation.get("language")
+    if not isinstance(language, Mapping) or not language:
+        raise ValueError("GR00T observation requires language data.")
+    for key, value in sorted(language.items()):
+        if not isinstance(value, list) or len(value) != 1:
+            raise ValueError(f"GR00T language.{key} must contain one outer batch row.")
+        if not isinstance(value[0], list) or not value[0] or any(not isinstance(item, str) for item in value[0]):
+            raise ValueError(f"GR00T language.{key} must contain a nonempty list of strings.")
+        signature.append(("language", key))
+    return tuple(signature)
+
+
+def _collate_observations(observations: list[dict[str, Any]]) -> dict[str, Any]:
+    first = observations[0]
+    return {
+        "video": {key: np.concatenate([obs["video"][key] for obs in observations], axis=0) for key in first["video"]},
+        "state": {key: np.concatenate([obs["state"][key] for obs in observations], axis=0) for key in first["state"]},
+        "language": {
+            key: [row for obs in observations for row in obs["language"][key]]
+            for key in first["language"]
+        },
+    }
 
 
 def _noise_generator(
@@ -158,7 +239,9 @@ def _noise_generator(
     if isinstance(generator, torch.Generator):
         return generator
     if generator is not None:
-        received = f"a list of {len(generator)} generators" if isinstance(generator, list) else type(generator).__name__
+        received = (
+            f"a list of {len(generator)} generators" if isinstance(generator, list) else type(generator).__name__
+        )
         logger.warning(
             "GR00T expects a single torch.Generator per request but got %s; ignoring it. The initial noise "
             "falls back to sampling_params.seed=%s, or to the global RNG when that is None.",

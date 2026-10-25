@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 import math
 
+import numpy as np
 import pytest
 import torch
 
@@ -35,6 +36,9 @@ from vllm_omni.diffusion.models.pi0.processor_pi0 import (
     pil_image_to_tensor,
     resize_with_pad,
 )
+from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -583,3 +587,100 @@ def test_version_stable_embed_image():
         f"embed_image std drifted: {std} vs {_GOLDEN_EMBED_IMAGE_STD} — "
         "likely a vision_tower weight-load regression under this transformers version."
     )
+
+
+class _BatchRecordingPi0Model:
+    def __init__(self):
+        self.calls = []
+
+    def _normalize_state(self, state):
+        return state
+
+    def _unnormalize_actions(self, actions):
+        return actions
+
+    def sample_actions(self, *, images, image_masks, lang_tokens, lang_masks, state, noise, num_steps):
+        self.calls.append((images, image_masks, lang_tokens, lang_masks, state, noise, num_steps))
+        signal = state[:, :1] + images[0].mean(dim=(1, 2, 3), keepdim=False)[:, None]
+        signal = signal + lang_tokens[:, 1:2].float() / 1000
+        return noise + signal[:, None, :]
+
+
+def _batch_pi0_pipeline():
+    from vllm_omni.diffusion.models.pi0.pipeline_pi0 import Pi0Pipeline
+
+    pipeline = object.__new__(Pi0Pipeline)
+    pipeline.config = Pi0Config.from_model_config({**_LEROBOT_CFG, "image_resolution": [4, 4]})
+    pipeline.tokenizer = _FakeTokenizer()
+    pipeline._device = torch.device("cpu")
+    pipeline.model = _BatchRecordingPi0Model()
+    return pipeline
+
+
+def _batch_pi0_request(index, *, noise=None, valid=True):
+    observation = {
+        "images": {_EXPECTED_CAMERA_ORDER[0]: np.full((4, 4, 3), 20 + index * 30, dtype=np.uint8)},
+        "state": np.full(32, index + 1, dtype=np.float32),
+        "prompt": f"task {index}",
+    }
+    extra_args = {"robot_obs": observation if valid else {"images": None, "state": None}}
+    if noise is not None:
+        extra_args["noise"] = noise
+    return OmniDiffusionRequest(
+        prompt=observation["prompt"],
+        request_id=f"pi0-{index}",
+        sampling_params=OmniDiffusionSamplingParams(seed=100 + index, num_inference_steps=3, extra_args=extra_args),
+    )
+
+
+@pytest.mark.parametrize("batch_size", [1, 2, 4])
+def test_pi0_batch_fuses_requests_and_preserves_seeded_rows(batch_size):
+    requests = [_batch_pi0_request(i) for i in range(batch_size)]
+    pipeline = _batch_pi0_pipeline()
+
+    results = pipeline.forward(DiffusionRequestBatch(requests))
+
+    assert len(pipeline.model.calls) == 1
+    images, masks, tokens, token_masks, state, noise, steps = pipeline.model.calls[0]
+    assert images[0].shape[0] == masks[0].shape[0] == tokens.shape[0] == batch_size
+    assert token_masks.shape[0] == state.shape[0] == noise.shape[0] == batch_size
+    assert steps == 3
+    assert all(not mask.any() for mask in masks[1:])
+    assert len(results) == batch_size
+    for index, request in enumerate(requests):
+        assert results[index].error is None
+        action = results[index].output["actions"]
+        assert action.shape == (50, 32) and action.dtype == np.float32
+        solo = _batch_pi0_pipeline().forward(DiffusionRequestBatch([request]))[0]
+        np.testing.assert_array_equal(action, solo.output["actions"])
+
+    reversed_results = _batch_pi0_pipeline().forward(DiffusionRequestBatch(list(reversed(requests))))
+    for original, reversed_output in zip(reversed(results), reversed_results):
+        np.testing.assert_array_equal(original.output["actions"], reversed_output.output["actions"])
+
+
+def test_pi0_bad_peer_does_not_fail_valid_request_and_explicit_noise_is_local():
+    fixed_noise = np.full((50, 32), 0.25, dtype=np.float32)
+    good = _batch_pi0_request(1, noise=fixed_noise)
+    pipeline = _batch_pi0_pipeline()
+
+    results = pipeline.forward(DiffusionRequestBatch([_batch_pi0_request(0, valid=False), good]))
+
+    assert results[0].error is not None
+    assert results[1].error is None
+    assert pipeline.model.calls[0][0][0].shape[0] == 1
+    torch.testing.assert_close(pipeline.model.calls[0][5][0], torch.from_numpy(fixed_noise))
+    solo = _batch_pi0_pipeline().forward(DiffusionRequestBatch([good]))[0]
+    np.testing.assert_array_equal(results[1].output["actions"], solo.output["actions"])
+
+
+def test_pi0_different_denoising_steps_do_not_share_a_forward():
+    first, second = _batch_pi0_request(0), _batch_pi0_request(1)
+    second.sampling_params.num_inference_steps = 4
+    pipeline = _batch_pi0_pipeline()
+
+    results = pipeline.forward(DiffusionRequestBatch([first, second]))
+
+    assert results[0].error is None
+    assert "num_inference_steps differs" in results[1].error
+    assert pipeline.model.calls[0][0][0].shape[0] == 1

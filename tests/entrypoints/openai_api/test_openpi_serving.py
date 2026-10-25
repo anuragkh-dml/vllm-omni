@@ -4,6 +4,7 @@
 import asyncio
 import json
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
@@ -14,6 +15,10 @@ from omegaconf import OmegaConf
 from starlette.testclient import TestClient
 from vllm import SamplingParams
 
+from vllm_omni.diffusion.data import DiffusionOutput
+from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.sched.request_scheduler import RequestScheduler
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.entrypoints.openpi import connection as openpi_connection
 from vllm_omni.entrypoints.openpi import serving as openpi_serving
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -103,7 +108,8 @@ class ConcurrentRecordingEngine(RecordingEngine):
                     self.condition.notify_all()
 
             await asyncio.to_thread(self._wait_for_expected_calls)
-            yield SimpleNamespace(multimodal_output={"actions": [0.0]})
+            value = {"first client": 1.0, "second client": 2.0}[prompt]
+            yield SimpleNamespace(multimodal_output={"actions": [value]})
 
         return _generate()
 
@@ -439,7 +445,7 @@ def test_two_websocket_clients_without_session_id_do_not_conflict(monkeypatch):
                 actions = _json_unpack(websocket.receive_bytes())
                 np.testing.assert_array_equal(
                     np.asarray(actions, dtype=np.float32),
-                    np.asarray([0.0], dtype=np.float32),
+                    np.asarray([1.0 if prompt == "first client" else 2.0], dtype=np.float32),
                 )
 
     with ThreadPoolExecutor(max_workers=2) as executor:
@@ -459,6 +465,141 @@ def test_two_websocket_clients_without_session_id_do_not_conflict(monkeypatch):
     sampling_params = [call["sampling_params_list"][0] for call in engine.generate_calls]
     assert [params.extra_args["session_id"] for params in sampling_params] == ["default", "default"]
     assert [params.extra_args["reset"] for params in sampling_params] == [True, True]
+    assert {params.extra_args["robot_obs"]["prompt"] for params in sampling_params} == {
+        "first client", "second client"
+    }
+
+
+def test_pi05_benchmark_identity_reaches_engine_request():
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=RecordingEngine())
+    session_id = "benchmark-lane-a"
+    benchmark_id = "benchmark-" + "a" * 32
+    request = serving.build_request(
+        {"prompt": "pick", "session_id": session_id, "benchmark_request_id": benchmark_id},
+        session_id=session_id, reset=True,
+    )
+
+    assert request.request_id.startswith(f"robot-{session_id}-")
+    assert request.sampling_params.extra_args["session_id"] == session_id
+    assert request.sampling_params.extra_args["robot_obs"]["benchmark_request_id"] == benchmark_id
+
+
+class _BatchIdentityPipeline:
+    supports_request_batch = True
+
+    def __init__(self):
+        self.calls = []
+
+    def forward(self, batch):
+        self.calls.append(batch.request_ids)
+        return [
+            DiffusionOutput(
+                output={
+                    "actions": np.array(
+                        [request.sampling_params.extra_args["robot_obs"]["observation_id"], batch.num_reqs],
+                        dtype=np.float32,
+                    )
+                }
+            )
+            for request in batch.requests
+        ]
+
+
+class _SchedulerBackedPolicyEngine(RecordingEngine):
+    """Lightweight engine facade with the real request scheduler and batch contract."""
+
+    def __init__(self, *, max_num_seqs=2, max_wait_ms=500.0):
+        super().__init__()
+        self.scheduler = RequestScheduler()
+        self.scheduler.initialize(SimpleNamespace(max_num_seqs=max_num_seqs, request_batch_max_wait_ms=max_wait_ms))
+        self.pipeline = _BatchIdentityPipeline()
+        self.condition = threading.Condition()
+        self.pending = {}
+        self.results = {}
+        self.worker = None
+        self.admission_wait_ms = None
+
+    def _dispatch(self):
+        with self.condition:
+            start = time.monotonic()
+            decision = self.scheduler.get_admission_wait_decision(now=start)
+            stable_since = start
+            last_waiting = 0
+            while True:
+                now = time.monotonic()
+                waiting = self.scheduler.num_waiting_requests()
+                if waiting > last_waiting:
+                    stable_since = now
+                    last_waiting = waiting
+                if self.scheduler.should_end_admission_wait(decision, now=now, stable_since=stable_since):
+                    break
+                self.condition.wait(timeout=min(0.002, max(decision.deadline - now, 0)))
+            self.admission_wait_ms = (time.monotonic() - start) * 1000
+            scheduled = self.scheduler.schedule()
+            requests = [self.pending[request_id][0] for request_id in scheduled.scheduled_request_ids]
+
+        results = self.pipeline.forward(DiffusionRequestBatch(requests))
+        with self.condition:
+            for request, result in zip(requests, results):
+                self.results[request.request_id] = result
+                self.pending[request.request_id][1].set()
+
+    def generate(self, *, prompt, request_id, sampling_params_list):
+        async def _generate():
+            request = OmniDiffusionRequest(
+                prompt=prompt, request_id=request_id, sampling_params=sampling_params_list[0]
+            )
+            done = threading.Event()
+            with self.condition:
+                self.pending[request_id] = (request, done)
+                self.scheduler.add_request(request)
+                if self.worker is None:
+                    self.worker = threading.Thread(target=self._dispatch, daemon=True)
+                    self.worker.start()
+                self.condition.notify_all()
+            assert await asyncio.to_thread(done.wait, 5.0)
+            result = self.results[request_id]
+            yield SimpleNamespace(multimodal_output=result.output)
+
+        return _generate()
+
+
+@pytest.mark.parametrize("client_count", [1, 2])
+def test_websocket_clients_receive_their_own_fused_or_partial_wave(client_count, monkeypatch):
+    monkeypatch.setattr(openpi_connection, "_pack", _json_pack)
+    monkeypatch.setattr(openpi_connection, "_unpack", _json_unpack)
+    engine = _SchedulerBackedPolicyEngine(max_num_seqs=2, max_wait_ms=500.0)
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=engine)
+    app = FastAPI()
+
+    @app.websocket("/v1/realtime/robot/openpi")
+    async def openpi_endpoint(websocket: WebSocket):
+        await openpi_connection.RobotRealtimeConnection(websocket, serving).handle_connection()
+
+    barrier = threading.Barrier(client_count)
+
+    def run_client(observation_id):
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime/robot/openpi") as websocket:
+                websocket.receive_bytes()  # handshake
+                barrier.wait(timeout=5.0)
+                websocket.send_bytes(
+                    _json_pack({"observation_id": observation_id, "prompt": f"client {observation_id}"})
+                )
+                action = np.asarray(_json_unpack(websocket.receive_bytes()), dtype=np.float32)
+                np.testing.assert_array_equal(action, [observation_id, client_count])
+
+    with ThreadPoolExecutor(max_workers=client_count) as executor:
+        futures = [executor.submit(run_client, index + 1) for index in range(client_count)]
+        for future in futures:
+            future.result(timeout=10.0)
+
+    engine.worker.join(timeout=5.0)
+    assert not engine.worker.is_alive()
+    assert len(engine.pipeline.calls) == 1
+    assert len(engine.pipeline.calls[0]) == client_count
+    assert len(set(engine.pipeline.calls[0])) == client_count
+    assert engine.admission_wait_ms < 650.0
 
 
 def test_infer_extracts_actions_from_generic_multimodal_output():

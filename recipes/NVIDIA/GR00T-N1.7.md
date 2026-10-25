@@ -49,16 +49,20 @@ vllm serve nvidia/GR00T-N1.7-3B \
 
 Notes:
 
-- Only `max_num_seqs: 1` is supported (configured in the deploy YAML). The
-  policy is markovian (`state_history_length=1`, `reset()` returns `{}`) — the
-  reason for the cap is that `Gr00tPolicy` does its own per-sample
-  (un)batching inside `get_action` and is not integrated with vLLM's
-  continuous batching path.
+- Request batching is opt-in. Copy the deploy YAML, set
+  `stages[0].max_num_seqs: 4` and
+  `stages[0].request_batch_max_wait_ms: 10`, then pass the copy to
+  `--deploy-config`. These example B and T values require GPU memory and
+  control-loop latency measurements before production use. A partial batch
+  can dispatch before T when arrivals stabilize. Keep `step_execution: false`;
+  the shipped config stays at B=1. The policy is markovian
+  (`state_history_length=1`, `reset()` returns `{}`), and the pipeline passes
+  independent observations and noise generators through its batch path.
 - This pipeline is a thin wrapper around the upstream HF policy
   (`AutoModel.from_pretrained` + `enforce_eager`, `tensor_parallel_size=1`,
   pipeline `load_weights` is a no-op). The standard diffusion accelerators
   (SP, CFG, TeaCache, VAE tiling) do not transfer to a flow-matching action
-  policy at batch size 1, so a native-kernel port is intentionally out of
+  policy, so a native-kernel port is intentionally out of
   scope for this recipe — the value is the OpenPI serving integration, not
   kernel-level acceleration.
 - The WebSocket endpoint is `ws://127.0.0.1:8000/v1/realtime/robot/openpi`.
