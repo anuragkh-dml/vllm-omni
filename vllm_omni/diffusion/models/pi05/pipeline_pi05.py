@@ -30,6 +30,7 @@ import torch
 from torch import nn
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.benchmark_expected_cohort import forward_cohort_telemetry
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.models.pi05.config import SUPPORTED_DTYPE_NAMES, Pi05Config
 from vllm_omni.diffusion.models.pi05.modeling_pi05 import Pi05ForActionPrediction
@@ -426,6 +427,7 @@ class Pi05Pipeline(nn.Module):
                             "status": "completed" if model_error is None else "failed",
                             "error_type": type(model_error).__name__ if model_error is not None else None,
                         }
+                        event.update(forward_cohort_telemetry(observations))
                         if os.environ.get("VLLM_OMNI_BENCH_DETAILED_TRACE") == "1":
                             traced = observations
                             event.update(

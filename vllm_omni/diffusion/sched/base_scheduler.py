@@ -206,11 +206,41 @@ class BaseScheduler(ABC):
 
     def benchmark_forward_start(self, output: DiffusionSchedulerOutput) -> None:
         request_ids = tuple(output.scheduled_request_ids)
+        start_ns = time.monotonic_ns()
         self._benchmark_active_forward = ({
-            "forward_id": f"{os.getpid()}:{output.step_id}", "start_ns": time.monotonic_ns(),
+            "forward_id": f"{os.getpid()}:{output.step_id}", "start_ns": start_ns,
             "request_ids": tuple(self._benchmark_progress_id(rid) for rid in request_ids),
             "internal_request_ids": request_ids,
         } if request_ids else None)
+        if request_ids and self._benchmark_active_forward is not None:
+            observations = [self._benchmark_trace_obs(self._request_states[rid])
+                            for rid in request_ids if rid in self._request_states]
+            if (observations and len(observations) == len(request_ids)
+                    and all(obs is not None and obs.get("benchmark_server_cohort_epoch_id")
+                            == observations[0].get("benchmark_server_cohort_epoch_id")
+                            and obs.get("benchmark_server_cohort_membership_hash")
+                            == observations[0].get("benchmark_server_cohort_membership_hash")
+                            for obs in observations)
+                    and observations[0].get("benchmark_server_cohort_epoch_id")):
+                first = observations[0]
+                self._benchmark_active_forward.update(
+                    cohort_epoch_id=first["benchmark_server_cohort_epoch_id"],
+                    cohort_membership_hash=first["benchmark_server_cohort_membership_hash"],
+                    cohort_expected_count=first["benchmark_server_cohort_expected_count"],
+                    cohort_arrived_count=first["benchmark_server_cohort_arrived_count"],
+                    cohort_missing_member_ids=first["benchmark_server_cohort_missing_member_ids"],
+                    cohort_executed_count=len(request_ids),
+                    cohort_first_queue_enter_ns=first["benchmark_server_cohort_first_queue_enter_ns"],
+                    cohort_last_queue_enter_ns=first["benchmark_server_cohort_last_queue_enter_ns"],
+                    cohort_close_ns=first["benchmark_server_cohort_close_ns"],
+                    cohort_close_reason=first["benchmark_server_cohort_close_reason"],
+                    cohort_configured_batch_wait_ms=first["benchmark_server_cohort_configured_wait_ms"],
+                    cohort_actual_batch_wait_ms=first["benchmark_server_cohort_actual_wait_ms"],
+                    cohort_metadata_validation_reason="valid",
+                )
+                for obs in observations:
+                    obs["benchmark_server_cohort_forward_start_ns"] = start_ns
+                    obs["benchmark_server_cohort_executed_count"] = len(request_ids)
         self._publish_benchmark_progress()
 
     def benchmark_forward_end(self) -> None:

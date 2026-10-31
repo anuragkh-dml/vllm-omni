@@ -13,6 +13,7 @@ import torch
 from torch import nn
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.benchmark_expected_cohort import forward_cohort_telemetry
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.models.gr00t.policy import Gr00tPolicy
@@ -244,6 +245,7 @@ class Gr00tN1d7Pipeline(nn.Module):
                             "status": "completed" if model_error is None else "failed",
                             "error_type": type(model_error).__name__ if model_error is not None else None,
                         }
+                        event.update(forward_cohort_telemetry(wire_observations))
                         if os.environ.get("VLLM_OMNI_BENCH_DETAILED_TRACE") == "1":
                             traced = wire_observations
                             event.update(

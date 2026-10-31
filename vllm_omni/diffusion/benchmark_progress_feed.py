@@ -41,14 +41,27 @@ class ProgressFeed:
                 self._events.append({"at_ns": at_ns, "kind": "queue_leave", "request_id": request_id})
             if self._active is not None and self._active != active:
                 self._events.append({"at_ns": at_ns, "kind": "forward_end",
-                                     "forward_id": self._active["forward_id"],
-                                     "request_ids": self._active["request_ids"]})
+                                     **{key: value for key, value in self._active.items()
+                                        if key != "internal_request_ids"}})
             if active is not None and self._active != active:
                 self._events.append({"at_ns": at_ns, "kind": "forward_start",
-                                     "forward_id": active["forward_id"],
-                                     "request_ids": active["request_ids"]})
+                                     **{key: value for key, value in active.items()
+                                        if key != "internal_request_ids"}})
             self._active = active
             self._queued = queued
+        self._wake.set()
+
+    def record_cohort_close(self, details: dict) -> None:
+        """Append a host-monotonic close event without blocking the scheduler on I/O."""
+        with self._lock:
+            self._events.append({"at_ns": details["close_ns"],
+                                 "kind": "cohort_close", **details})
+        self._wake.set()
+
+    def record_metadata_rejection(self, details: dict) -> None:
+        """Expose a rejected cohort contract without admitting it to the queue."""
+        with self._lock:
+            self._events.append({"kind": "cohort_metadata_rejected", **details})
         self._wake.set()
 
     def _run(self) -> None:
