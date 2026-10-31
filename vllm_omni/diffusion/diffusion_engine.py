@@ -760,11 +760,19 @@ class DiffusionEngine:
 
             try:
                 self._prepare_kv_for_forward(sched_output)
-                runner_output: BaseRunnerOutput = (
-                    self.execute_fn(sched_output)
-                    if sched_output.scheduled_request_ids
-                    else BatchRunnerOutput.from_list([])
-                )
+                progress_start = getattr(self.scheduler, "benchmark_forward_start", None)
+                progress_end = getattr(self.scheduler, "benchmark_forward_end", None)
+                if progress_start is not None:
+                    progress_start(sched_output)
+                try:
+                    runner_output: BaseRunnerOutput = (
+                        self.execute_fn(sched_output)
+                        if sched_output.scheduled_request_ids
+                        else BatchRunnerOutput.from_list([])
+                    )
+                finally:
+                    if progress_end is not None:
+                        progress_end()
                 self._poll_native_kv()
                 worker_execution_completed = True
             except Exception as exc:

@@ -16,6 +16,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import RequestStatus
 
+from vllm_omni.diffusion.benchmark_progress_feed import ProgressFeed
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.diffusion_kv.kv_connector import (
@@ -61,6 +62,9 @@ class BaseScheduler(ABC):
         self.od_config: OmniDiffusionConfig | None = None
         self._request_states: dict[str, SchedulerRequestState] = {}
         self._benchmark_detailed_trace = os.environ.get("VLLM_OMNI_BENCH_DETAILED_TRACE") == "1"
+        progress_path = os.environ.get("VLLM_OMNI_BENCH_STATUS_PATH")
+        self._benchmark_progress = ProgressFeed(progress_path) if progress_path else None
+        self._benchmark_active_forward = None
         self._step_id: int = 0
         self._waiting: deque[str] = deque()
         self._running: list[str] = []
@@ -145,6 +149,7 @@ class BaseScheduler(ABC):
 
         self._kv_connector = create_scheduler_kv_connector(od_config, kv_cache_config, kv_vllm_config)
         self._reset_scheduler_state()
+        self._publish_benchmark_progress()
 
     @property
     def kv_connector(self):
@@ -166,6 +171,7 @@ class BaseScheduler(ABC):
             obs = self._benchmark_trace_obs(state)
             if obs is not None:
                 obs["benchmark_server_queue_enter_ns"] = time.monotonic_ns()
+        self._publish_benchmark_progress()
         logger.debug("%s add_request: %s (waiting=%d)", self.__class__.__name__, request_id, len(self._waiting))
         return request_id
 
@@ -176,6 +182,40 @@ class BaseScheduler(ABC):
         if isinstance(obs, dict) and obs.get("benchmark_request_id"):
             return obs
         return None
+
+    def _benchmark_progress_id(self, request_id: str) -> str:
+        state = self._request_states.get(request_id)
+        if state is None:
+            return request_id
+        obs = self._benchmark_trace_obs(state)
+        if obs is not None:
+            return str(obs["benchmark_request_id"])
+        return str(getattr(state.req, "external_req_id", None) or request_id)
+
+    def _publish_benchmark_progress(self) -> None:
+        if self._benchmark_progress is None:
+            return
+        active = self._benchmark_active_forward
+        active_internal = set(active["internal_request_ids"]) if active else set()
+        queued_internal = tuple(dict.fromkeys((*self._running, *self._waiting)))
+        queued = tuple(self._benchmark_progress_id(rid) for rid in queued_internal
+                       if rid not in active_internal)
+        public_active = ({key: value for key, value in active.items()
+                          if key != "internal_request_ids"} if active else None)
+        self._benchmark_progress.publish(public_active, queued)
+
+    def benchmark_forward_start(self, output: DiffusionSchedulerOutput) -> None:
+        request_ids = tuple(output.scheduled_request_ids)
+        self._benchmark_active_forward = ({
+            "forward_id": f"{os.getpid()}:{output.step_id}", "start_ns": time.monotonic_ns(),
+            "request_ids": tuple(self._benchmark_progress_id(rid) for rid in request_ids),
+            "internal_request_ids": request_ids,
+        } if request_ids else None)
+        self._publish_benchmark_progress()
+
+    def benchmark_forward_end(self) -> None:
+        self._benchmark_active_forward = None
+        self._publish_benchmark_progress()
 
     def schedule(self) -> DiffusionSchedulerOutput:
         scheduled_new_reqs: list[NewRequestData] = []
@@ -354,6 +394,7 @@ class BaseScheduler(ABC):
         self._step_id += 1
         self._finished_req_ids.clear()
         self._kv_finished_request_ids.clear()
+        self._publish_benchmark_progress()
         return scheduler_output
 
     def _try_native_prefetch(self) -> None:
@@ -582,6 +623,8 @@ class BaseScheduler(ABC):
         self._finish_requests({request_id: status for request_id in request_ids})
 
     def close(self) -> None:
+        if self._benchmark_progress is not None:
+            self._benchmark_progress.close()
         self._shutdown_diffusion_kv()
         self._request_states.clear()
         self._waiting.clear()
@@ -657,6 +700,7 @@ class BaseScheduler(ABC):
                 state.error = None
 
         self._finished_req_ids |= finished_req_ids
+        self._publish_benchmark_progress()
         return finished_req_ids
 
     def _release_request_kv(self, state: SchedulerRequestState, status: DiffusionRequestStatus) -> None:
