@@ -1214,7 +1214,7 @@ def test_pi05_benchmark_telemetry_names_only_executed_rows(monkeypatch):
 
     monkeypatch.setenv("VLLM_OMNI_BENCH_BATCH_TELEMETRY", "1")
     records = []
-    monkeypatch.setattr(pipeline_pi05.logger, "info", lambda fmt, payload: records.append((fmt, payload)))
+    monkeypatch.setattr(pipeline_pi05.os, "write", lambda fd, payload: records.append((fd, payload)))
     pipeline = _batch_pi05_pipeline()
     pipeline.od_config = SimpleNamespace(max_num_seqs=4, request_batch_max_wait_ms=10.0)
     requests = [_batch_pi05_request(index, valid=index != 0) for index in range(3)]
@@ -1229,8 +1229,9 @@ def test_pi05_benchmark_telemetry_names_only_executed_rows(monkeypatch):
     assert outputs[0].error is not None
     assert all(output.error is None for output in outputs[1:])
     assert len(pipeline.model.calls) == 1
-    assert len(records) == 1 and records[0][0] == "BENCH_PI05_FORWARD %s"
-    event = json.loads(records[0][1])
+    assert len(records) == 1 and records[0][0] == 2
+    assert records[0][1].startswith(b"BENCH_PI05_FORWARD ")
+    event = json.loads(records[0][1].split(b"BENCH_PI05_FORWARD ", 1)[1])
     assert event["executed_batch_size"] == pipeline.model.calls[0][0][0].shape[0] == 2
     assert event["benchmark_request_ids"] == [f"benchmark-{index:032x}" for index in (1, 2)]
     assert event["engine_request_ids"] == ["pi05-1", "pi05-2"]
@@ -1249,7 +1250,7 @@ def test_pi05_benchmark_telemetry_logs_failed_model_call(monkeypatch):
 
     monkeypatch.setenv("VLLM_OMNI_BENCH_BATCH_TELEMETRY", "1")
     records = []
-    monkeypatch.setattr(pipeline_pi05.logger, "info", lambda fmt, payload: records.append(json.loads(payload)))
+    monkeypatch.setattr(pipeline_pi05.os, "write", lambda fd, payload: records.append((fd, payload)))
 
     class FailingModel:
         def sample_actions(self, **kwargs):
@@ -1263,9 +1264,11 @@ def test_pi05_benchmark_telemetry_logs_failed_model_call(monkeypatch):
     with pytest.raises(RuntimeError, match="model failed"):
         pipeline.forward(DiffusionRequestBatch([request]))
     assert len(records) == 1
-    assert records[0]["status"] == "failed"
-    assert records[0]["error_type"] == "RuntimeError"
-    assert records[0]["executed_batch_size"] == 1
+    assert records[0][0] == 2
+    event = json.loads(records[0][1].split(b"BENCH_PI05_FORWARD ", 1)[1])
+    assert event["status"] == "failed"
+    assert event["error_type"] == "RuntimeError"
+    assert event["executed_batch_size"] == 1
 
 
 def test_pi05_different_denoising_steps_do_not_share_a_forward():
@@ -1278,3 +1281,37 @@ def test_pi05_different_denoising_steps_do_not_share_a_forward():
     assert results[0].error is None
     assert "num_inference_steps differs" in results[1].error
     assert pipeline.model.calls[0][0][0].shape[0] == 1
+
+
+def test_pi05_detailed_trace_adds_server_milestones(monkeypatch):
+    from vllm_omni.diffusion.models.pi05 import pipeline_pi05
+
+    monkeypatch.setenv("VLLM_OMNI_BENCH_BATCH_TELEMETRY", "1")
+    monkeypatch.setenv("VLLM_OMNI_BENCH_DETAILED_TRACE", "1")
+    records = []
+    monkeypatch.setattr(pipeline_pi05.os, "write", lambda fd, payload: records.append(payload))
+    pipeline = _batch_pi05_pipeline()
+    pipeline.od_config = SimpleNamespace(max_num_seqs=2, request_batch_max_wait_ms=10.0)
+    requests = [_batch_pi05_request(index) for index in range(2)]
+    for index, request in enumerate(requests):
+        request.sampling_params.extra_args["robot_obs"].update(
+            benchmark_request_id=f"benchmark-{index:032x}",
+            benchmark_run_id="trace-run",
+            benchmark_server_received_ns=10 + index,
+            benchmark_server_queue_enter_ns=20 + index,
+            benchmark_server_queue_leave_ns=30 + index,
+            benchmark_batch_opened_ns=20,
+            benchmark_batch_closed_ns=40,
+        )
+
+    pipeline.forward(DiffusionRequestBatch(requests))
+
+    assert len(records) == 1
+    event = json.loads(records[0].split(b"BENCH_PI05_FORWARD ", 1)[1])
+    assert event["trace_schema_version"] == "control_loop_trace.v1"
+    assert event["benchmark_run_ids"] == ["trace-run", "trace-run"]
+    assert event["server_received_ns"] == [10, 11]
+    assert event["server_queue_enter_ns"] == [20, 21]
+    assert event["server_queue_leave_ns"] == [30, 31]
+    assert (event["batch_opened_ns"], event["batch_closed_ns"]) == (20, 40)
+    assert event["actual_batch_wait_ms"] == pytest.approx(20 / 1e6)

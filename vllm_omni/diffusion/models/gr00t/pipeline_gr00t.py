@@ -1,8 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import json
+import os
+import time
 from collections.abc import Iterable, Mapping
 from typing import Any
+from uuid import uuid4
 
 import numpy as np
 import torch
@@ -17,6 +21,21 @@ from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 logger = init_logger(__name__)
+
+
+def _benchmark_telemetry_enabled() -> bool:
+    if os.environ.get("VLLM_OMNI_BENCH_BATCH_TELEMETRY") != "1":
+        return False
+    distributed = torch.distributed
+    return not distributed.is_available() or not distributed.is_initialized() or distributed.get_rank() == 0
+
+
+def _benchmark_request_id(observation: Mapping) -> str | None:
+    value = observation.get("benchmark_request_id")
+    if not isinstance(value, str) or not value.startswith("benchmark-"):
+        return None
+    suffix = value.removeprefix("benchmark-")
+    return value if len(suffix) == 32 and all(char in "0123456789abcdef" for char in suffix) else None
 
 
 def _to_float32_action_dict(actions: Mapping[str, Any]) -> dict[str, np.ndarray]:
@@ -44,6 +63,7 @@ class Gr00tN1d7Pipeline(nn.Module):
         super().__init__()
         model_config = od_config.model_config
         self.model_path = od_config.model
+        self.od_config = od_config
         self.embodiment_tag = str(model_config.get("embodiment_tag") or "OXE_DROID_RELATIVE_EEF_RELATIVE_JOINT")
         self.strict = bool(model_config.get("strict", True))
         self.device = get_local_device()
@@ -121,6 +141,7 @@ class Gr00tN1d7Pipeline(nn.Module):
         outputs: list[DiffusionOutput | None] = [None] * req.num_reqs
         valid_indices: list[int] = []
         observations: list[dict[str, Any]] = []
+        wire_observations: list[Mapping[str, Any]] = []
         generators: list[torch.Generator | None] = []
         signature: tuple[Any, ...] | None = None
 
@@ -156,6 +177,7 @@ class Gr00tN1d7Pipeline(nn.Module):
             signature = row_signature
             valid_indices.append(index)
             observations.append(policy_obs)
+            wire_observations.append(robot_obs)
             generators.append(generator)
 
         if valid_indices:
@@ -166,7 +188,83 @@ class Gr00tN1d7Pipeline(nn.Module):
                 options = {"generator": generators[0]}
             else:
                 options = None
-            result = self.policy.get_action(policy_obs, options)
+            telemetry_enabled = _benchmark_telemetry_enabled()
+            start_event = end_event = None
+            if telemetry_enabled and self.device.type == "cuda":
+                try:
+                    device_module = torch.get_device_module(self.device)
+                    start_event = device_module.Event(enable_timing=True)
+                    end_event = device_module.Event(enable_timing=True)
+                    start_event.record()
+                except Exception:
+                    start_event = end_event = None
+                    logger.warning("GR00T benchmark CUDA timing unavailable", exc_info=True)
+            forward_start_ns = time.monotonic_ns() if telemetry_enabled else 0
+            model_error: BaseException | None = None
+            try:
+                result = self.policy.get_action(policy_obs, options)
+            except BaseException as exc:
+                model_error = exc
+                raise
+            finally:
+                if telemetry_enabled:
+                    forward_end_ns = time.monotonic_ns()
+                    cuda_event_ms = cuda_sync_overhead_ms = None
+                    try:
+                        if start_event is not None and end_event is not None:
+                            end_event.record()
+                            sync_start_ns = time.monotonic_ns()
+                            end_event.synchronize()
+                            cuda_event_ms = start_event.elapsed_time(end_event)
+                            cuda_sync_overhead_ms = (time.monotonic_ns() - sync_start_ns) / 1e6
+                    except Exception:
+                        logger.warning("GR00T benchmark CUDA timing unavailable", exc_info=True)
+                    try:
+                        event = {
+                            "schema": "vllm_omni.gr00t.get_action.v1",
+                            "batch_id": uuid4().hex,
+                            "benchmark_request_ids": [
+                                _benchmark_request_id(observation) for observation in wire_observations
+                            ],
+                            "engine_request_ids": [req.requests[index].request_id for index in valid_indices],
+                            "session_ids": [observation.get("session_id") for observation in wire_observations],
+                            "executed_batch_size": len(valid_indices),
+                            "configured_max_num_seqs": getattr(self.od_config, "max_num_seqs", None),
+                            "configured_request_batch_max_wait_ms": getattr(
+                                self.od_config, "request_batch_max_wait_ms", None
+                            ),
+                            "scheduler_queue_wait_ms": [
+                                req.requests[index].scheduler_queue_wait_ms for index in valid_indices
+                            ],
+                            "forward_start_ns": forward_start_ns,
+                            "forward_end_ns": forward_end_ns,
+                            "cpu_forward_ms": (forward_end_ns - forward_start_ns) / 1e6,
+                            "cuda_event_ms": cuda_event_ms,
+                            "cuda_sync_overhead_ms": cuda_sync_overhead_ms,
+                            "status": "completed" if model_error is None else "failed",
+                            "error_type": type(model_error).__name__ if model_error is not None else None,
+                        }
+                        if os.environ.get("VLLM_OMNI_BENCH_DETAILED_TRACE") == "1":
+                            traced = wire_observations
+                            event.update(
+                                trace_schema_version="control_loop_trace.v1",
+                                clock_domain="host_monotonic_ns",
+                                benchmark_run_ids=[obs.get("benchmark_run_id") for obs in traced],
+                                server_received_ns=[obs.get("benchmark_server_received_ns") for obs in traced],
+                                server_queue_enter_ns=[obs.get("benchmark_server_queue_enter_ns") for obs in traced],
+                                server_queue_leave_ns=[obs.get("benchmark_server_queue_leave_ns") for obs in traced],
+                            )
+                            opened = [obs.get("benchmark_batch_opened_ns") for obs in traced]
+                            closed = [obs.get("benchmark_batch_closed_ns") for obs in traced]
+                            if opened and all(value == opened[0] for value in opened) and \
+                                    all(value == closed[0] for value in closed) and \
+                                    opened[0] is not None and closed[0] is not None:
+                                event["batch_opened_ns"] = opened[0]
+                                event["batch_closed_ns"] = closed[0]
+                                event["actual_batch_wait_ms"] = (closed[0] - opened[0]) / 1e6
+                        os.write(2, ("BENCH_GR00T_FORWARD " + json.dumps(event, separators=(",", ":")) + "\n").encode())
+                    except Exception:
+                        logger.warning("GR00T benchmark telemetry emission failed", exc_info=True)
             actions = result[0] if isinstance(result, tuple) else result
             if not isinstance(actions, Mapping):
                 raise TypeError(f"GR00T policy returned {type(actions).__name__}; expected dict actions.")

@@ -457,3 +457,24 @@ def test_handle_connection_reset_endpoint_resets_next_infer(monkeypatch):
     serving.reset.assert_called_once_with({})
     assert websocket.sent_bytes[2] == {"status": "reset successful"}
     assert websocket.sent_texts == []
+
+
+def test_detailed_trace_records_websocket_receipt_for_benchmark_request(monkeypatch):
+    monkeypatch.setenv("VLLM_OMNI_BENCH_DETAILED_TRACE", "1")
+    monkeypatch.setattr(openpi_connection, "_pack", lambda obj: obj)
+    monkeypatch.setattr(
+        openpi_connection,
+        "_unpack",
+        lambda _data: {"benchmark_request_id": "benchmark-" + "a" * 32},
+    )
+    websocket = FakeWebSocket(
+        [{"type": "websocket.receive", "bytes": b"request"}, {"type": "websocket.disconnect"}]
+    )
+    serving = _serving_mock()
+
+    asyncio.run(openpi_connection.RobotRealtimeConnection(websocket, serving).handle_connection())
+
+    observation = serving.infer.await_args.args[0]
+    assert observation["benchmark_request_id"] == "benchmark-" + "a" * 32
+    assert isinstance(observation["benchmark_server_received_ns"], int)
+    assert observation["benchmark_server_received_ns"] > 0

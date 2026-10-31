@@ -29,6 +29,8 @@ mappings.
 from __future__ import annotations
 
 import asyncio
+import os
+import time
 from collections import OrderedDict
 from typing import Any
 
@@ -173,6 +175,7 @@ class RobotRealtimeConnection:
         self.websocket = websocket
         self.serving = serving
         self._idle_timeout = idle_timeout
+        self._benchmark_detailed_trace = os.environ.get("VLLM_OMNI_BENCH_DETAILED_TRACE") == "1"
         self._current_session_id: str | None = None
         # Session ids seen on this connection, most-recently-used last.
         self._seen_sessions: OrderedDict[str, None] = OrderedDict()
@@ -246,8 +249,13 @@ class RobotRealtimeConnection:
                 if "bytes" not in msg or not msg["bytes"]:
                     continue
 
+                # Capture receipt before decoding; add only a scalar to the
+                # benchmark observation, never a copy of its payload.
+                trace_received_ns = time.monotonic_ns() if self._benchmark_detailed_trace else None
                 try:
                     obs = self._unpack_request(msg["bytes"])
+                    if trace_received_ns is not None and obs.get("benchmark_request_id"):
+                        obs["benchmark_server_received_ns"] = trace_received_ns
                 except Exception:
                     logger.exception("Invalid robot OpenPI request payload")
                     try:

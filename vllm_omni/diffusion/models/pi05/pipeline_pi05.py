@@ -426,7 +426,31 @@ class Pi05Pipeline(nn.Module):
                             "status": "completed" if model_error is None else "failed",
                             "error_type": type(model_error).__name__ if model_error is not None else None,
                         }
-                        logger.info("BENCH_PI05_FORWARD %s", json.dumps(event, separators=(",", ":")))
+                        if os.environ.get("VLLM_OMNI_BENCH_DETAILED_TRACE") == "1":
+                            traced = observations
+                            event.update(
+                                trace_schema_version="control_loop_trace.v1",
+                                clock_domain="host_monotonic_ns",
+                                benchmark_run_ids=[obs.get("benchmark_run_id") for obs in traced],
+                                server_received_ns=[obs.get("benchmark_server_received_ns") for obs in traced],
+                                server_queue_enter_ns=[obs.get("benchmark_server_queue_enter_ns") for obs in traced],
+                                server_queue_leave_ns=[obs.get("benchmark_server_queue_leave_ns") for obs in traced],
+                            )
+                            opened = [obs.get("benchmark_batch_opened_ns") for obs in traced]
+                            closed = [obs.get("benchmark_batch_closed_ns") for obs in traced]
+                            if opened and all(value == opened[0] for value in opened) and \
+                                    all(value == closed[0] for value in closed) and \
+                                    opened[0] is not None and closed[0] is not None:
+                                event["batch_opened_ns"] = opened[0]
+                                event["batch_closed_ns"] = closed[0]
+                                event["actual_batch_wait_ms"] = (closed[0] - opened[0]) / 1e6
+                        # Worker INFO logs may be filtered by the multiprocess
+                        # executor. Write the opt-in benchmark event to the
+                        # inherited stderr so the server log retains it.
+                        os.write(
+                            2,
+                            ("BENCH_PI05_FORWARD " + json.dumps(event, separators=(",", ":")) + "\n").encode(),
+                        )
                     except Exception:
                         logger.warning("Pi05 benchmark telemetry emission failed", exc_info=True)
             expected_shape = (len(valid_indices), self.config.chunk_size, self.config.max_action_dim)

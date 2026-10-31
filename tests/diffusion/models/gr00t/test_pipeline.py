@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import json
 from types import SimpleNamespace
 from typing import Any
 
@@ -157,7 +158,7 @@ class _BatchRecordingPolicy(FakeGr00tPolicy):
         self.calls.append((obs, options))
         count = obs["video"]["cam"].shape[0]
         generators = options["generators"] if "generators" in options else [options["generator"]]
-        noise = np.array([torch.randn((), generator=item).item() for item in generators], dtype=np.float32)
+        noise = np.array([torch.randn((), generator=item, device=item.device).item() for item in generators], dtype=np.float32)
         pixels = obs["video"]["cam"][:, 0, 0, 0, 0].astype(np.float32)
         states = obs["state"]["joint"][:, 0, 0]
         prompts = np.array([len(row[0]) for row in obs["language"][self.language_key]], dtype=np.float32)
@@ -228,3 +229,34 @@ def test_gr00t_invalid_peer_keeps_valid_output():
     assert pipeline.policy.calls[0][0]["video"]["cam"].shape[0] == 1
     solo = _batch_gr00t_pipeline().forward(DiffusionRequestBatch([good]))[0]
     np.testing.assert_array_equal(results[1].output["actions"]["arm"], solo.output["actions"]["arm"])
+
+
+def test_gr00t_detailed_trace_adds_server_milestones(monkeypatch):
+    monkeypatch.setenv("VLLM_OMNI_BENCH_BATCH_TELEMETRY", "1")
+    monkeypatch.setenv("VLLM_OMNI_BENCH_DETAILED_TRACE", "1")
+    records = []
+    monkeypatch.setattr(pipeline_gr00t.os, "write", lambda fd, payload: records.append(payload))
+    pipeline = _batch_gr00t_pipeline()
+    requests = [_batch_gr00t_request(index) for index in range(2)]
+    for index, request in enumerate(requests):
+        request.sampling_params.extra_args["robot_obs"].update(
+            benchmark_request_id=f"benchmark-{index:032x}",
+            benchmark_run_id="trace-run",
+            benchmark_server_received_ns=10 + index,
+            benchmark_server_queue_enter_ns=20 + index,
+            benchmark_server_queue_leave_ns=30 + index,
+            benchmark_batch_opened_ns=20,
+            benchmark_batch_closed_ns=40,
+        )
+
+    pipeline.forward(DiffusionRequestBatch(requests))
+
+    assert len(records) == 1
+    event = json.loads(records[0].split(b"BENCH_GR00T_FORWARD ", 1)[1])
+    assert event["trace_schema_version"] == "control_loop_trace.v1"
+    assert event["benchmark_run_ids"] == ["trace-run", "trace-run"]
+    assert event["server_received_ns"] == [10, 11]
+    assert event["server_queue_enter_ns"] == [20, 21]
+    assert event["server_queue_leave_ns"] == [30, 31]
+    assert (event["batch_opened_ns"], event["batch_closed_ns"]) == (20, 40)
+    assert event["actual_batch_wait_ms"] == pytest.approx(20 / 1e6)
