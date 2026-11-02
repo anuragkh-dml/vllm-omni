@@ -1220,7 +1220,7 @@ def test_pi05_benchmark_telemetry_names_only_executed_rows(monkeypatch):
     requests = [_batch_pi05_request(index, valid=index != 0) for index in range(3)]
     for index, request in enumerate(requests):
         obs = request.sampling_params.extra_args["robot_obs"]
-        obs["benchmark_request_id"] = f"benchmark-{index:032x}"
+        obs["request_id"] = f"benchmark-{index:032x}"
         obs["session_id"] = f"session-{index}"
         request.scheduler_queue_wait_ms = index + 0.25
 
@@ -1260,7 +1260,7 @@ def test_pi05_benchmark_telemetry_logs_failed_model_call(monkeypatch):
     pipeline.od_config = SimpleNamespace(max_num_seqs=1, request_batch_max_wait_ms=5.0)
     pipeline.model = FailingModel()
     request = _batch_pi05_request(0)
-    request.sampling_params.extra_args["robot_obs"]["benchmark_request_id"] = "benchmark-" + "a" * 32
+    request.sampling_params.extra_args["robot_obs"]["request_id"] = "benchmark-" + "a" * 32
     with pytest.raises(RuntimeError, match="model failed"):
         pipeline.forward(DiffusionRequestBatch([request]))
     assert len(records) == 1
@@ -1295,7 +1295,7 @@ def test_pi05_detailed_trace_adds_server_milestones(monkeypatch):
     requests = [_batch_pi05_request(index) for index in range(2)]
     for index, request in enumerate(requests):
         request.sampling_params.extra_args["robot_obs"].update(
-            benchmark_request_id=f"benchmark-{index:032x}",
+            request_id=f"benchmark-{index:032x}",
             benchmark_run_id="trace-run",
             benchmark_server_received_ns=10 + index,
             benchmark_server_queue_enter_ns=20 + index,

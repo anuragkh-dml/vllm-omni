@@ -30,7 +30,7 @@ import torch
 from torch import nn
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.benchmark_expected_cohort import forward_cohort_telemetry
+from vllm_omni.diffusion.cohort_protocol import cohort_forward_telemetry
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.models.pi05.config import SUPPORTED_DTYPE_NAMES, Pi05Config
 from vllm_omni.diffusion.models.pi05.modeling_pi05 import Pi05ForActionPrediction
@@ -61,12 +61,9 @@ def _benchmark_telemetry_enabled() -> bool:
     return not distributed.is_available() or not distributed.is_initialized() or distributed.get_rank() == 0
 
 
-def _benchmark_request_id(observation: Mapping) -> str | None:
-    value = observation.get("benchmark_request_id")
-    if not isinstance(value, str) or not value.startswith("benchmark-"):
-        return None
-    suffix = value.removeprefix("benchmark-")
-    return value if len(suffix) == 32 and all(char in "0123456789abcdef" for char in suffix) else None
+def _request_id(observation: Mapping) -> str | None:
+    value = observation.get("request_id")
+    return value if isinstance(value, str) and 0 < len(value) <= 256 else None
 
 
 def _checkpoint_declared_keys(model_dir: str) -> set[str]:
@@ -406,7 +403,7 @@ class Pi05Pipeline(nn.Module):
                             "schema": "vllm_omni.pi05.sample_actions.v1",
                             "batch_id": uuid4().hex,
                             "benchmark_request_ids": [
-                                _benchmark_request_id(observation) for observation in observations
+                                _request_id(observation) for observation in observations
                             ],
                             "engine_request_ids": [req.requests[index].request_id for index in valid_indices],
                             "session_ids": [observation.get("session_id") for observation in observations],
@@ -427,7 +424,7 @@ class Pi05Pipeline(nn.Module):
                             "status": "completed" if model_error is None else "failed",
                             "error_type": type(model_error).__name__ if model_error is not None else None,
                         }
-                        event.update(forward_cohort_telemetry(observations))
+                        event.update(cohort_forward_telemetry(observations))
                         if os.environ.get("VLLM_OMNI_BENCH_DETAILED_TRACE") == "1":
                             traced = observations
                             event.update(

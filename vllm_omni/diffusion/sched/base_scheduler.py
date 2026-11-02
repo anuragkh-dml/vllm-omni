@@ -17,6 +17,7 @@ from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import RequestStatus
 
 from vllm_omni.diffusion.benchmark_progress_feed import ProgressFeed
+from vllm_omni.diffusion.cohort_protocol import COHORT_RECEIPT_FIELD
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.diffusion_kv.kv_connector import (
@@ -179,7 +180,7 @@ class BaseScheduler(ABC):
     def _benchmark_trace_obs(state: SchedulerRequestState) -> dict | None:
         extra = getattr(state.req.sampling_params, "extra_args", None) or {}
         obs = extra.get("robot_obs")
-        if isinstance(obs, dict) and obs.get("benchmark_request_id"):
+        if isinstance(obs, dict) and obs.get("request_id"):
             return obs
         return None
 
@@ -189,7 +190,7 @@ class BaseScheduler(ABC):
             return request_id
         obs = self._benchmark_trace_obs(state)
         if obs is not None:
-            return str(obs["benchmark_request_id"])
+            return str(obs["request_id"])
         return str(getattr(state.req, "external_req_id", None) or request_id)
 
     def _publish_benchmark_progress(self) -> None:
@@ -198,49 +199,62 @@ class BaseScheduler(ABC):
         active = self._benchmark_active_forward
         active_internal = set(active["internal_request_ids"]) if active else set()
         queued_internal = tuple(dict.fromkeys((*self._running, *self._waiting)))
-        queued = tuple(self._benchmark_progress_id(rid) for rid in queued_internal
-                       if rid not in active_internal)
-        public_active = ({key: value for key, value in active.items()
-                          if key != "internal_request_ids"} if active else None)
+        queued = tuple(self._benchmark_progress_id(rid) for rid in queued_internal if rid not in active_internal)
+        public_active = (
+            {key: value for key, value in active.items() if key != "internal_request_ids"} if active else None
+        )
         self._benchmark_progress.publish(public_active, queued)
 
     def benchmark_forward_start(self, output: DiffusionSchedulerOutput) -> None:
         request_ids = tuple(output.scheduled_request_ids)
         start_ns = time.monotonic_ns()
-        self._benchmark_active_forward = ({
-            "forward_id": f"{os.getpid()}:{output.step_id}", "start_ns": start_ns,
-            "request_ids": tuple(self._benchmark_progress_id(rid) for rid in request_ids),
-            "internal_request_ids": request_ids,
-        } if request_ids else None)
+        self._benchmark_active_forward = (
+            {
+                "forward_id": f"{os.getpid()}:{output.step_id}",
+                "start_ns": start_ns,
+                "request_ids": tuple(self._benchmark_progress_id(rid) for rid in request_ids),
+                "internal_request_ids": request_ids,
+            }
+            if request_ids
+            else None
+        )
         if request_ids and self._benchmark_active_forward is not None:
-            observations = [self._benchmark_trace_obs(self._request_states[rid])
-                            for rid in request_ids if rid in self._request_states]
-            if (observations and len(observations) == len(request_ids)
-                    and all(obs is not None and obs.get("benchmark_server_cohort_epoch_id")
-                            == observations[0].get("benchmark_server_cohort_epoch_id")
-                            and obs.get("benchmark_server_cohort_membership_hash")
-                            == observations[0].get("benchmark_server_cohort_membership_hash")
-                            for obs in observations)
-                    and observations[0].get("benchmark_server_cohort_epoch_id")):
-                first = observations[0]
+            observations = [
+                self._benchmark_trace_obs(self._request_states[rid])
+                for rid in request_ids
+                if rid in self._request_states
+            ]
+            receipts = [obs.get(COHORT_RECEIPT_FIELD) if obs is not None else None for obs in observations]
+            cohort_receipts = [receipt for receipt in receipts if isinstance(receipt, dict)]
+            if (
+                len(cohort_receipts) == len(request_ids)
+                and cohort_receipts
+                and all(
+                    receipt.get("epoch_id") == cohort_receipts[0].get("epoch_id")
+                    and receipt.get("membership_hash") == cohort_receipts[0].get("membership_hash")
+                    for receipt in cohort_receipts
+                )
+                and cohort_receipts[0].get("epoch_id")
+            ):
+                first = cohort_receipts[0]
                 self._benchmark_active_forward.update(
-                    cohort_epoch_id=first["benchmark_server_cohort_epoch_id"],
-                    cohort_membership_hash=first["benchmark_server_cohort_membership_hash"],
-                    cohort_expected_count=first["benchmark_server_cohort_expected_count"],
-                    cohort_arrived_count=first["benchmark_server_cohort_arrived_count"],
-                    cohort_missing_member_ids=first["benchmark_server_cohort_missing_member_ids"],
+                    cohort_epoch_id=first["epoch_id"],
+                    cohort_membership_hash=first["membership_hash"],
+                    cohort_expected_count=first["expected_count"],
+                    cohort_arrived_count=first["arrived_count"],
+                    cohort_missing_member_ids=first["missing_member_ids"],
                     cohort_executed_count=len(request_ids),
-                    cohort_first_queue_enter_ns=first["benchmark_server_cohort_first_queue_enter_ns"],
-                    cohort_last_queue_enter_ns=first["benchmark_server_cohort_last_queue_enter_ns"],
-                    cohort_close_ns=first["benchmark_server_cohort_close_ns"],
-                    cohort_close_reason=first["benchmark_server_cohort_close_reason"],
-                    cohort_configured_batch_wait_ms=first["benchmark_server_cohort_configured_wait_ms"],
-                    cohort_actual_batch_wait_ms=first["benchmark_server_cohort_actual_wait_ms"],
+                    cohort_first_queue_enter_ns=first["first_queue_enter_ns"],
+                    cohort_last_queue_enter_ns=first["last_queue_enter_ns"],
+                    cohort_close_ns=first["close_ns"],
+                    cohort_close_reason=first["close_reason"],
+                    cohort_configured_batch_wait_ms=first["configured_batch_wait_ms"],
+                    cohort_actual_batch_wait_ms=first["actual_batch_wait_ms"],
                     cohort_metadata_validation_reason="valid",
                 )
-                for obs in observations:
-                    obs["benchmark_server_cohort_forward_start_ns"] = start_ns
-                    obs["benchmark_server_cohort_executed_count"] = len(request_ids)
+                for receipt in cohort_receipts:
+                    receipt["forward_start_ns"] = start_ns
+                    receipt["executed_count"] = len(request_ids)
         self._publish_benchmark_progress()
 
     def benchmark_forward_end(self) -> None:
@@ -356,12 +370,15 @@ class BaseScheduler(ABC):
         if self._benchmark_detailed_trace and scheduled_new_reqs:
             # Formation opens when the first member entered the scheduler
             # queue and closes when scheduling commits this batch.
-            opened = min((
-                obs["benchmark_server_queue_enter_ns"]
-                for item in scheduled_new_reqs
-                if (obs := self._benchmark_trace_obs(self._request_states[item.request_id])) is not None
-                and "benchmark_server_queue_enter_ns" in obs
-            ), default=None)
+            opened = min(
+                (
+                    obs["benchmark_server_queue_enter_ns"]
+                    for item in scheduled_new_reqs
+                    if (obs := self._benchmark_trace_obs(self._request_states[item.request_id])) is not None
+                    and "benchmark_server_queue_enter_ns" in obs
+                ),
+                default=None,
+            )
             if opened is not None:
                 closed = time.monotonic_ns()
                 for item in scheduled_new_reqs:

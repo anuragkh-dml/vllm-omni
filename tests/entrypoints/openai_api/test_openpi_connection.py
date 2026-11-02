@@ -465,7 +465,7 @@ def test_detailed_trace_records_websocket_receipt_for_benchmark_request(monkeypa
     monkeypatch.setattr(
         openpi_connection,
         "_unpack",
-        lambda _data: {"benchmark_request_id": "benchmark-" + "a" * 32},
+        lambda _data: {"request_id": "benchmark-" + "a" * 32},
     )
     websocket = FakeWebSocket(
         [{"type": "websocket.receive", "bytes": b"request"}, {"type": "websocket.disconnect"}]
@@ -475,6 +475,6 @@ def test_detailed_trace_records_websocket_receipt_for_benchmark_request(monkeypa
     asyncio.run(openpi_connection.RobotRealtimeConnection(websocket, serving).handle_connection())
 
     observation = serving.infer.await_args.args[0]
-    assert observation["benchmark_request_id"] == "benchmark-" + "a" * 32
+    assert observation["request_id"] == "benchmark-" + "a" * 32
     assert isinstance(observation["benchmark_server_received_ns"], int)
     assert observation["benchmark_server_received_ns"] > 0
