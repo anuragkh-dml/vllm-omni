@@ -240,7 +240,7 @@ def test_gr00t_detailed_trace_adds_server_milestones(monkeypatch):
     requests = [_batch_gr00t_request(index) for index in range(2)]
     for index, request in enumerate(requests):
         request.sampling_params.extra_args["robot_obs"].update(
-            benchmark_request_id=f"benchmark-{index:032x}",
+            request_id=f"benchmark-{index:032x}",
             benchmark_run_id="trace-run",
             benchmark_server_received_ns=10 + index,
             benchmark_server_queue_enter_ns=20 + index,

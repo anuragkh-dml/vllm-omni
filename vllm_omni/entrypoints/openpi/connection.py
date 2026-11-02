@@ -254,7 +254,7 @@ class RobotRealtimeConnection:
                 trace_received_ns = time.monotonic_ns() if self._benchmark_detailed_trace else None
                 try:
                     obs = self._unpack_request(msg["bytes"])
-                    if trace_received_ns is not None and obs.get("benchmark_request_id"):
+                    if trace_received_ns is not None and obs.get("request_id"):
                         obs["benchmark_server_received_ns"] = trace_received_ns
                 except Exception:
                     logger.exception("Invalid robot OpenPI request payload")

@@ -475,13 +475,13 @@ def test_pi05_benchmark_identity_reaches_engine_request():
     session_id = "benchmark-lane-a"
     benchmark_id = "benchmark-" + "a" * 32
     request = serving.build_request(
-        {"prompt": "pick", "session_id": session_id, "benchmark_request_id": benchmark_id},
+        {"prompt": "pick", "session_id": session_id, "request_id": benchmark_id},
         session_id=session_id, reset=True,
     )
 
     assert request.request_id.startswith(f"robot-{session_id}-")
     assert request.sampling_params.extra_args["session_id"] == session_id
-    assert request.sampling_params.extra_args["robot_obs"]["benchmark_request_id"] == benchmark_id
+    assert request.sampling_params.extra_args["robot_obs"]["request_id"] == benchmark_id
 
 
 class _BatchIdentityPipeline:

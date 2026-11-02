@@ -14,7 +14,13 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCache
 from vllm.v1.outputs import KVConnectorOutput
 
 from tests.helpers.kv_layout import build_kv_cache_tensor
-from vllm_omni.diffusion.data import DiffusionOutput, DiffusionRequestAbortedError
+from vllm_omni.diffusion.cohort_protocol import (
+    COHORT_RECEIPT_FIELD,
+    COHORT_WIRE_FIELD,
+    COHORT_WIRE_SCHEMA,
+    membership_hash,
+)
+from vllm_omni.diffusion.data import DiffusionOutput, DiffusionRequestAbortedError, OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine, DiffusionExecutionMode
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.diffusion_kv.request import DiffusionKVRequest
@@ -672,8 +678,9 @@ class TestRequestScheduler:
         mocker.patch.object(
             self.scheduler,
             "_can_schedule_waiting",
-            side_effect=lambda state: can_schedule(state)
-            and not (state.request_id == "deferred" and manager.has_request("deferred")),
+            side_effect=lambda state: (
+                can_schedule(state) and not (state.request_id == "deferred" and manager.has_request("deferred"))
+            ),
         )
         for request_id in ("admitted", "deferred"):
             request = _make_request(request_id)
@@ -2357,7 +2364,7 @@ def test_detailed_trace_records_queue_and_batch_boundaries(monkeypatch):
     scheduler.initialize(SimpleNamespace(max_num_seqs=2))
     observations = []
     for index in range(2):
-        observation = {"benchmark_request_id": f"benchmark-{index:032x}"}
+        observation = {"request_id": f"benchmark-{index:032x}"}
         observations.append(observation)
         scheduler.add_request(
             _make_step_request(
@@ -2381,3 +2388,46 @@ def test_detailed_trace_records_queue_and_batch_boundaries(monkeypatch):
         assert opened <= observation["benchmark_server_queue_enter_ns"]
         assert observation["benchmark_server_queue_enter_ns"] <= observation["benchmark_server_queue_leave_ns"]
         assert observation["benchmark_server_queue_leave_ns"] <= closed
+
+
+def test_neutral_cohort_wire_schedules_exact_membership(monkeypatch):
+    monkeypatch.setenv("VLLM_OMNI_COHORT_SCHEDULING", "1")
+    monkeypatch.setenv("VLLM_OMNI_COHORT_POLICY_ID", "policy-v1")
+    scheduler = RequestScheduler()
+    scheduler.initialize(OmniDiffusionConfig(max_num_seqs=2, request_batch_max_wait_ms=25.0))
+    members = ["robot-a", "robot-b"]
+    observations = []
+    for member in members:
+        request_id = f"route/{member}"
+        observation = {
+            "request_id": request_id,
+            COHORT_WIRE_FIELD: {
+                "schema": COHORT_WIRE_SCHEMA,
+                "epoch_id": "route/epoch/7",
+                "member_ids": members,
+                "membership_hash": membership_hash(members),
+                "deadline_ns": 10**18,
+                "policy_id": "policy-v1",
+                "member_id": member,
+                "request_id": request_id,
+            },
+        }
+        observations.append(observation)
+        scheduler.add_request(
+            _make_step_request(
+                f"server-{member}",
+                sampling_params=OmniDiffusionSamplingParams(
+                    num_inference_steps=1,
+                    seed=123,
+                    extra_args={"robot_obs": observation},
+                ),
+            )
+        )
+
+    output = scheduler.schedule()
+
+    assert _new_ids(output) == ["server-robot-a", "server-robot-b"]
+    receipts = [observation[COHORT_RECEIPT_FIELD] for observation in observations]
+    assert {receipt["epoch_id"] for receipt in receipts} == {"route/epoch/7"}
+    assert {receipt["executed_count"] for receipt in receipts} == {2}
+    assert {receipt["close_reason"] for receipt in receipts} == {"expected_count"}
