@@ -243,24 +243,6 @@ class Gr00tN1d7Pipeline(nn.Module):
                             "error_type": type(model_error).__name__ if model_error is not None else None,
                         }
                         event.update(cohort_forward_telemetry(wire_observations))
-                        if os.environ.get("VLLM_OMNI_BENCH_DETAILED_TRACE") == "1":
-                            traced = wire_observations
-                            event.update(
-                                trace_schema_version="control_loop_trace.v1",
-                                clock_domain="host_monotonic_ns",
-                                benchmark_run_ids=[obs.get("benchmark_run_id") for obs in traced],
-                                server_received_ns=[obs.get("benchmark_server_received_ns") for obs in traced],
-                                server_queue_enter_ns=[obs.get("benchmark_server_queue_enter_ns") for obs in traced],
-                                server_queue_leave_ns=[obs.get("benchmark_server_queue_leave_ns") for obs in traced],
-                            )
-                            opened = [obs.get("benchmark_batch_opened_ns") for obs in traced]
-                            closed = [obs.get("benchmark_batch_closed_ns") for obs in traced]
-                            if opened and all(value == opened[0] for value in opened) and \
-                                    all(value == closed[0] for value in closed) and \
-                                    opened[0] is not None and closed[0] is not None:
-                                event["batch_opened_ns"] = opened[0]
-                                event["batch_closed_ns"] = closed[0]
-                                event["actual_batch_wait_ms"] = (closed[0] - opened[0]) / 1e6
                         os.write(2, ("BENCH_GR00T_FORWARD " + json.dumps(event, separators=(",", ":")) + "\n").encode())
                     except Exception:
                         logger.warning("GR00T benchmark telemetry emission failed", exc_info=True)

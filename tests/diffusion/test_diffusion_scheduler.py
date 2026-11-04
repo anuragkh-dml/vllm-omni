@@ -2358,38 +2358,6 @@ class TestPendingFinishedRequestIds:
         assert sched.schedule().finished_req_ids == {"a"}
 
 
-def test_detailed_trace_records_queue_and_batch_boundaries(monkeypatch):
-    monkeypatch.setenv("VLLM_OMNI_BENCH_DETAILED_TRACE", "1")
-    scheduler = RequestScheduler()
-    scheduler.initialize(SimpleNamespace(max_num_seqs=2))
-    observations = []
-    for index in range(2):
-        observation = {"request_id": f"benchmark-{index:032x}"}
-        observations.append(observation)
-        scheduler.add_request(
-            _make_step_request(
-                f"trace-{index}",
-                sampling_params=OmniDiffusionSamplingParams(
-                    num_inference_steps=1,
-                    seed=123,
-                    extra_args={"robot_obs": observation},
-                ),
-            )
-        )
-
-    output = scheduler.schedule()
-
-    assert _new_ids(output) == ["trace-0", "trace-1"]
-    opened = observations[0]["benchmark_batch_opened_ns"]
-    closed = observations[0]["benchmark_batch_closed_ns"]
-    assert observations[1]["benchmark_batch_opened_ns"] == opened
-    assert observations[1]["benchmark_batch_closed_ns"] == closed
-    for observation in observations:
-        assert opened <= observation["benchmark_server_queue_enter_ns"]
-        assert observation["benchmark_server_queue_enter_ns"] <= observation["benchmark_server_queue_leave_ns"]
-        assert observation["benchmark_server_queue_leave_ns"] <= closed
-
-
 def test_neutral_cohort_wire_schedules_exact_membership(monkeypatch):
     monkeypatch.setenv("VLLM_OMNI_COHORT_SCHEDULING", "1")
     monkeypatch.setenv("VLLM_OMNI_COHORT_POLICY_ID", "policy-v1")

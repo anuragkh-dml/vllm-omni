@@ -1281,37 +1281,3 @@ def test_pi05_different_denoising_steps_do_not_share_a_forward():
     assert results[0].error is None
     assert "num_inference_steps differs" in results[1].error
     assert pipeline.model.calls[0][0][0].shape[0] == 1
-
-
-def test_pi05_detailed_trace_adds_server_milestones(monkeypatch):
-    from vllm_omni.diffusion.models.pi05 import pipeline_pi05
-
-    monkeypatch.setenv("VLLM_OMNI_BENCH_BATCH_TELEMETRY", "1")
-    monkeypatch.setenv("VLLM_OMNI_BENCH_DETAILED_TRACE", "1")
-    records = []
-    monkeypatch.setattr(pipeline_pi05.os, "write", lambda fd, payload: records.append(payload))
-    pipeline = _batch_pi05_pipeline()
-    pipeline.od_config = SimpleNamespace(max_num_seqs=2, request_batch_max_wait_ms=10.0)
-    requests = [_batch_pi05_request(index) for index in range(2)]
-    for index, request in enumerate(requests):
-        request.sampling_params.extra_args["robot_obs"].update(
-            request_id=f"benchmark-{index:032x}",
-            benchmark_run_id="trace-run",
-            benchmark_server_received_ns=10 + index,
-            benchmark_server_queue_enter_ns=20 + index,
-            benchmark_server_queue_leave_ns=30 + index,
-            benchmark_batch_opened_ns=20,
-            benchmark_batch_closed_ns=40,
-        )
-
-    pipeline.forward(DiffusionRequestBatch(requests))
-
-    assert len(records) == 1
-    event = json.loads(records[0].split(b"BENCH_PI05_FORWARD ", 1)[1])
-    assert event["trace_schema_version"] == "control_loop_trace.v1"
-    assert event["benchmark_run_ids"] == ["trace-run", "trace-run"]
-    assert event["server_received_ns"] == [10, 11]
-    assert event["server_queue_enter_ns"] == [20, 21]
-    assert event["server_queue_leave_ns"] == [30, 31]
-    assert (event["batch_opened_ns"], event["batch_closed_ns"]) == (20, 40)
-    assert event["actual_batch_wait_ms"] == pytest.approx(20 / 1e6)

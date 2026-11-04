@@ -62,7 +62,6 @@ class BaseScheduler(ABC):
     def __init__(self) -> None:
         self.od_config: OmniDiffusionConfig | None = None
         self._request_states: dict[str, SchedulerRequestState] = {}
-        self._benchmark_detailed_trace = os.environ.get("VLLM_OMNI_BENCH_DETAILED_TRACE") == "1"
         progress_path = os.environ.get("VLLM_OMNI_BENCH_STATUS_PATH")
         self._benchmark_progress = ProgressFeed(progress_path) if progress_path else None
         self._benchmark_active_forward = None
@@ -168,21 +167,9 @@ class BaseScheduler(ABC):
         state.queued_at = time.perf_counter()
         self._request_states[request_id] = state
         self._waiting.append(request_id)
-        if self._benchmark_detailed_trace:
-            obs = self._benchmark_trace_obs(state)
-            if obs is not None:
-                obs["benchmark_server_queue_enter_ns"] = time.monotonic_ns()
         self._publish_benchmark_progress()
         logger.debug("%s add_request: %s (waiting=%d)", self.__class__.__name__, request_id, len(self._waiting))
         return request_id
-
-    @staticmethod
-    def _benchmark_trace_obs(state: SchedulerRequestState) -> dict | None:
-        extra = getattr(state.req.sampling_params, "extra_args", None) or {}
-        obs = extra.get("robot_obs")
-        if isinstance(obs, dict) and obs.get("request_id"):
-            return obs
-        return None
 
     def _benchmark_progress_id(self, request_id: str) -> str:
         state = self._request_states.get(request_id)
@@ -344,10 +331,6 @@ class BaseScheduler(ABC):
                             sequence.num_computed_tokens = request.num_computed_tokens
 
             self._waiting.popleft()
-            if self._benchmark_detailed_trace:
-                obs = self._benchmark_trace_obs(state)
-                if obs is not None:
-                    obs["benchmark_server_queue_leave_ns"] = time.monotonic_ns()
             if request_id == self._native_prefetch_request_id:
                 self._native_prefetch_request_id = None
             was_new_request = state.status == DiffusionRequestStatus.WAITING
@@ -367,26 +350,6 @@ class BaseScheduler(ABC):
                 scheduled_cached_request_ids.append(request_id)
 
         self._waiting.extendleft(reversed(deferred))
-        if self._benchmark_detailed_trace and scheduled_new_reqs:
-            # Formation opens when the first member entered the scheduler
-            # queue and closes when scheduling commits this batch.
-            opened = min(
-                (
-                    obs["benchmark_server_queue_enter_ns"]
-                    for item in scheduled_new_reqs
-                    if (obs := self._benchmark_trace_obs(self._request_states[item.request_id])) is not None
-                    and "benchmark_server_queue_enter_ns" in obs
-                ),
-                default=None,
-            )
-            if opened is not None:
-                closed = time.monotonic_ns()
-                for item in scheduled_new_reqs:
-                    obs = self._benchmark_trace_obs(self._request_states[item.request_id])
-                    if obs is not None:
-                        obs["benchmark_batch_opened_ns"] = opened
-                        obs["benchmark_batch_closed_ns"] = closed
-
         # Expose the next waiting request (serial mode) so the runner can
         # prefetch its KV during this forward.  Skip a request without
         # kv_sender_info (would target the wrong sender under multi-replica) or
