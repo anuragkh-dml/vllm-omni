@@ -2399,3 +2399,27 @@ def test_neutral_cohort_wire_schedules_exact_membership(monkeypatch):
     assert {receipt["epoch_id"] for receipt in receipts} == {"route/epoch/7"}
     assert {receipt["executed_count"] for receipt in receipts} == {2}
     assert {receipt["close_reason"] for receipt in receipts} == {"expected_count"}
+
+
+def test_benchmark_progress_resolves_request_ids_without_detailed_trace():
+    scheduler = RequestScheduler()
+    scheduler.initialize(OmniDiffusionConfig(max_num_seqs=2, request_batch_max_wait_ms=0.0))
+    observation = {"request_id": "route/robot-a"}
+    scheduler.add_request(
+        _make_step_request(
+            "server-robot-a",
+            sampling_params=OmniDiffusionSamplingParams(
+                num_inference_steps=1,
+                extra_args={"robot_obs": observation},
+            ),
+        )
+    )
+    assert scheduler._benchmark_progress_id("server-robot-a") == "route/robot-a"
+
+    output = scheduler.schedule()
+    scheduler.benchmark_forward_start(output)
+    assert scheduler._benchmark_active_forward["request_ids"] == ("route/robot-a",)
+    scheduler.benchmark_forward_end()
+
+    scheduler.add_request(_make_step_request("server-warmup"))
+    assert scheduler._benchmark_progress_id("server-warmup") == "server-warmup"

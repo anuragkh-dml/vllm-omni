@@ -171,11 +171,19 @@ class BaseScheduler(ABC):
         logger.debug("%s add_request: %s (waiting=%d)", self.__class__.__name__, request_id, len(self._waiting))
         return request_id
 
+    @staticmethod
+    def _benchmark_observation(state: SchedulerRequestState) -> dict | None:
+        extra = getattr(state.req.sampling_params, "extra_args", None) or {}
+        observation = extra.get("robot_obs")
+        if isinstance(observation, dict) and observation.get("request_id"):
+            return observation
+        return None
+
     def _benchmark_progress_id(self, request_id: str) -> str:
         state = self._request_states.get(request_id)
         if state is None:
             return request_id
-        obs = self._benchmark_trace_obs(state)
+        obs = self._benchmark_observation(state)
         if obs is not None:
             return str(obs["request_id"])
         return str(getattr(state.req, "external_req_id", None) or request_id)
@@ -207,7 +215,7 @@ class BaseScheduler(ABC):
         )
         if request_ids and self._benchmark_active_forward is not None:
             observations = [
-                self._benchmark_trace_obs(self._request_states[rid])
+                self._benchmark_observation(self._request_states[rid])
                 for rid in request_ids
                 if rid in self._request_states
             ]
