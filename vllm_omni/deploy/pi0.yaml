@@ -51,3 +51,8 @@ stages:
         action_horizon: 50
         action_dim: 32
         max_cameras: 3
+        rtc:
+          schema_version: 1
+          modes: [guided]
+          model_action_space: normalized
+          prefix_attention_schedules: [linear, exp, ones, zeros]

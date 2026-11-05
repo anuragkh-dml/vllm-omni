@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """CPU unit tests for the π0 (Pi-Zero) VLA model.
 
 Deliberately lightweight: pure utility code (config plumbing, mask building,
@@ -536,6 +536,7 @@ def _selfconsist_inputs(device):
 def _selfconsist_model(device):
     import safetensors.torch
 
+    assert _SELFCONSIST_CKPT is not None
     model = Pi0ForActionPrediction(
         Pi0Config(max_action_dim=32, max_state_dim=32, chunk_size=50, num_inference_steps=10, dtype="float32")
     )
@@ -592,6 +593,7 @@ def test_version_stable_embed_image():
 class _BatchRecordingPi0Model:
     def __init__(self):
         self.calls = []
+        self.rtc_batches = []
 
     def _normalize_state(self, state):
         return state
@@ -599,7 +601,8 @@ class _BatchRecordingPi0Model:
     def _unnormalize_actions(self, actions):
         return actions
 
-    def sample_actions(self, *, images, image_masks, lang_tokens, lang_masks, state, noise, num_steps):
+    def sample_actions(self, *, images, image_masks, lang_tokens, lang_masks, state, noise, num_steps, rtc=None):
+        self.rtc_batches.append(rtc)
         self.calls.append((images, image_masks, lang_tokens, lang_masks, state, noise, num_steps))
         signal = state[:, :1] + images[0].mean(dim=(1, 2, 3), keepdim=False)[:, None]
         signal = signal + lang_tokens[:, 1:2].float() / 1000
@@ -617,7 +620,7 @@ def _batch_pi0_pipeline():
     return pipeline
 
 
-def _batch_pi0_request(index, *, noise=None, valid=True):
+def _batch_pi0_request(index, *, noise=None, rtc=None, valid=True):
     observation = {
         "images": {_EXPECTED_CAMERA_ORDER[0]: np.full((4, 4, 3), 20 + index * 30, dtype=np.uint8)},
         "state": np.full(32, index + 1, dtype=np.float32),
@@ -626,6 +629,8 @@ def _batch_pi0_request(index, *, noise=None, valid=True):
     extra_args = {"robot_obs": observation if valid else {"images": None, "state": None}}
     if noise is not None:
         extra_args["noise"] = noise
+    if rtc is not None:
+        extra_args["rtc"] = rtc
     return OmniDiffusionRequest(
         prompt=observation["prompt"],
         request_id=f"pi0-{index}",
@@ -672,6 +677,24 @@ def test_pi0_bad_peer_does_not_fail_valid_request_and_explicit_noise_is_local():
     torch.testing.assert_close(pipeline.model.calls[0][5][0], torch.from_numpy(fixed_noise))
     solo = _batch_pi0_pipeline().forward(DiffusionRequestBatch([good]))[0]
     np.testing.assert_array_equal(results[1].output["actions"], solo.output["actions"])
+
+
+def test_pi0_rtc_request_returns_canonical_and_model_space_actions():
+    rtc = {
+        "schema_version": 1,
+        "mode": "guided",
+        "previous_actions": np.zeros((50, 32), dtype=np.float32),
+        "inference_delay": 2,
+        "execution_horizon": 10,
+        "correlation": {"generation": 3},
+    }
+    pipeline = _batch_pi0_pipeline()
+
+    result = pipeline.forward(DiffusionRequestBatch([_batch_pi0_request(0, rtc=rtc)]))[0]
+
+    assert pipeline.model.rtc_batches[0] is not None
+    assert set(result.output) == {"actions", "model_actions", "rtc"}
+    assert result.output["rtc"]["correlation"] == {"generation": 3}
 
 
 def test_pi0_different_denoising_steps_do_not_share_a_forward():

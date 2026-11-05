@@ -426,15 +426,20 @@ def test_from_pretrained_does_not_override_explicit_norm_stats(tmp_path):
     [
         ("use_visual_memory", True),
         ("use_proprioceptive_memory", True),
-        ("rtc_config", {"mode": "trained", "inference_delay": 2}),
         ("n_obs_steps", 6),
     ],
 )
 def test_config_rejects_unsupported_capability(key, value):
-    """MEM and RTC change what a correct action chunk looks like and are not
+    """MEM changes what a correct action chunk looks like and is not
     visible in the weights. Serving such a checkpoint must fail loudly."""
     with pytest.raises(UnsupportedCheckpointCapabilityError, match=key):
         Pi05Config.from_model_config(dict(_LEROBOT_CFG, **{key: value}))
+
+
+def test_config_rtc_declaration_does_not_implicitly_enable_rtc():
+    config = Pi05Config.from_model_config(dict(_LEROBOT_CFG, rtc_config={"mode": "guided", "inference_delay": 2}))
+
+    assert config.chunk_size == _LEROBOT_CFG["chunk_size"]
 
 
 # ----------------------------------------------------------------------------
@@ -1050,8 +1055,9 @@ class _SpyModel:
         self.seen: list = []
         self.generators: list = []
 
-    def sample_actions(self, *, images, image_masks, lang_tokens, lang_masks, num_steps, generator):
+    def sample_actions(self, *, images, image_masks, lang_tokens, lang_masks, num_steps, generator, rtc=None):
         del images, image_masks, lang_tokens, lang_masks
+        assert rtc is None
         self.seen.append(num_steps)
         self.generators.append(generator)
         return torch.zeros(1, 50, 32)
@@ -1124,8 +1130,10 @@ class _BatchPi05Tokenizer:
 class _BatchRecordingPi05Model:
     def __init__(self):
         self.calls = []
+        self.rtc_batches = []
 
-    def sample_actions(self, *, images, image_masks, lang_tokens, lang_masks, num_steps, generator):
+    def sample_actions(self, *, images, image_masks, lang_tokens, lang_masks, num_steps, generator, rtc=None):
+        self.rtc_batches.append(rtc)
         self.calls.append((images, image_masks, lang_tokens, lang_masks, num_steps, generator))
         generators = generator if isinstance(generator, list) else [generator] * lang_tokens.shape[0]
         noise = torch.stack([torch.randn((50, 32), generator=item) for item in generators])
@@ -1146,7 +1154,7 @@ def _batch_pi05_pipeline():
     return pipeline
 
 
-def _batch_pi05_request(index, *, valid=True):
+def _batch_pi05_request(index, *, rtc=None, valid=True):
     observation = {
         "images": {_EXPECTED_CAMERA_ORDER[0]: np.full((4, 4, 3), 20 + index * 30, dtype=np.uint8)},
         "state": np.full(32, index + 1, dtype=np.float32),
@@ -1154,13 +1162,16 @@ def _batch_pi05_request(index, *, valid=True):
     }
     if not valid:
         observation["images"] = {}
+    extra_args = {"robot_obs": observation}
+    if rtc is not None:
+        extra_args["rtc"] = rtc
     return OmniDiffusionRequest(
         prompt=observation["prompt"],
         request_id=f"pi05-{index}",
         sampling_params=OmniDiffusionSamplingParams(
             seed=200 + index,
             num_inference_steps=3,
-            extra_args={"robot_obs": observation},
+            extra_args=extra_args,
         ),
     )
 
@@ -1207,6 +1218,24 @@ def test_pi05_invalid_peer_keeps_valid_relative_action():
     assert pipeline.model.calls[0][0][0].shape[0] == 1
     solo = _batch_pi05_pipeline().forward(DiffusionRequestBatch([good]))[0]
     np.testing.assert_array_equal(results[1].output["actions"], solo.output["actions"])
+
+
+def test_pi05_rtc_request_returns_canonical_and_model_space_actions():
+    rtc = {
+        "schema_version": 1,
+        "mode": "guided",
+        "previous_actions": np.zeros((50, 32), dtype=np.float32),
+        "inference_delay": 2,
+        "execution_horizon": 10,
+        "correlation": {"generation": 3},
+    }
+    pipeline = _batch_pi05_pipeline()
+
+    result = pipeline.forward(DiffusionRequestBatch([_batch_pi05_request(0, rtc=rtc)]))[0]
+
+    assert pipeline.model.rtc_batches[0] is not None
+    assert set(result.output) == {"actions", "model_actions", "rtc"}
+    assert result.output["rtc"]["correlation"] == {"generation": 3}
 
 
 def test_pi05_benchmark_telemetry_names_only_executed_rows(monkeypatch):

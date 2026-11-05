@@ -351,6 +351,26 @@ def test_build_request_forwards_num_inference_steps():
     assert "sampling_params" not in request.sampling_params.extra_args["robot_obs"]
 
 
+def test_build_request_forwards_versioned_rtc_envelope():
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=_engine_with_policy_config())
+    rtc = {
+        "schema_version": 1,
+        "mode": "guided",
+        "previous_actions": np.zeros((50, 32), dtype=np.float32),
+        "inference_delay": 2,
+        "execution_horizon": 10,
+    }
+
+    request = serving._build_request(
+        {"prompt": "pick up the object", "sampling_params": {"rtc": rtc}},
+        session_id="session-a",
+        reset=False,
+    )
+
+    assert request.sampling_params.extra_args["rtc"] is rtc
+    assert "sampling_params" not in request.sampling_params.extra_args["robot_obs"]
+
+
 def test_build_request_omits_num_inference_steps_when_not_sent():
     """Absent must stay absent: the pipeline reads None as "use the configured
     default", so materialising a null here would be a different request."""
@@ -465,9 +485,7 @@ def test_two_websocket_clients_without_session_id_do_not_conflict(monkeypatch):
     sampling_params = [call["sampling_params_list"][0] for call in engine.generate_calls]
     assert [params.extra_args["session_id"] for params in sampling_params] == ["default", "default"]
     assert [params.extra_args["reset"] for params in sampling_params] == [True, True]
-    assert {params.extra_args["robot_obs"]["prompt"] for params in sampling_params} == {
-        "first client", "second client"
-    }
+    assert {params.extra_args["robot_obs"]["prompt"] for params in sampling_params} == {"first client", "second client"}
 
 
 def test_pi05_benchmark_identity_reaches_engine_request():
@@ -476,7 +494,8 @@ def test_pi05_benchmark_identity_reaches_engine_request():
     benchmark_id = "benchmark-" + "a" * 32
     request = serving.build_request(
         {"prompt": "pick", "session_id": session_id, "request_id": benchmark_id},
-        session_id=session_id, reset=True,
+        session_id=session_id,
+        reset=True,
     )
 
     assert request.request_id.startswith(f"robot-{session_id}-")
@@ -594,11 +613,13 @@ def test_websocket_clients_receive_their_own_fused_or_partial_wave(client_count,
         for future in futures:
             future.result(timeout=10.0)
 
+    assert engine.worker is not None
     engine.worker.join(timeout=5.0)
     assert not engine.worker.is_alive()
     assert len(engine.pipeline.calls) == 1
     assert len(engine.pipeline.calls[0]) == client_count
     assert len(set(engine.pipeline.calls[0])) == client_count
+    assert engine.admission_wait_ms is not None
     assert engine.admission_wait_ms < 650.0
 
 
@@ -743,6 +764,23 @@ def test_extract_actions_does_not_iterate_result_object():
     actions = serving._extract_actions(IterableResult())
 
     np.testing.assert_allclose(actions, np.array([[1.0, 2.0, 3.0]], dtype=np.float32))
+
+
+def test_extract_actions_preserves_rtc_dual_space_response():
+    result = SimpleNamespace(
+        multimodal_output={
+            "actions": [[1.0, 2.0]],
+            "model_actions": [[0.1, 0.2]],
+            "rtc": {"schema_version": 1, "mode": "guided", "correlation": {"generation": 4}},
+        }
+    )
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=_engine_with_policy_config())
+
+    output = serving._extract_actions(result)
+
+    np.testing.assert_allclose(output["actions"], np.array([[1.0, 2.0]], dtype=np.float32))
+    np.testing.assert_allclose(output["model_actions"], np.array([[0.1, 0.2]], dtype=np.float32))
+    assert output["rtc"]["correlation"] == {"generation": 4}
 
 
 def test_drop_session_calls_dreamzero_close_hook():

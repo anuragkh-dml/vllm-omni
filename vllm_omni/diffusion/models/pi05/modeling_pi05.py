@@ -42,6 +42,8 @@ from transformers.models.paligemma.modeling_paligemma import (
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
+from vllm_omni.diffusion.models.pi_rtc import GuidedRTCBatch, guided_rtc_velocity
+
 logger = logging.getLogger(__name__)
 
 # ──────────────────────────────────────────────────────────────────────
@@ -694,6 +696,7 @@ class Pi05ForActionPrediction(nn.Module):
         noise: torch.Tensor | None = None,
         num_steps: int | None = None,
         generator: torch.Generator | list[torch.Generator | None] | None = None,
+        rtc: GuidedRTCBatch | None = None,
     ) -> torch.Tensor:
         """Generate an action chunk via iterative flow-matching denoising.
 
@@ -723,6 +726,10 @@ class Pi05ForActionPrediction(nn.Module):
                     device=device,
                     generator=generator,
                 )
+        elif rtc is not None:
+            # See π0: an explicit noise tensor may have been created under the
+            # pipeline's inference mode and needs one normal copy for the VJP.
+            noise = noise.clone()
 
         # 1. Prefix embeddings + mask building.
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
@@ -747,12 +754,24 @@ class Pi05ForActionPrediction(nn.Module):
         for step in range(num_steps):
             t = 1.0 + step * dt
             time_tensor = torch.full((bsize,), t, dtype=torch.float32, device=device)
-            v_t = self.denoise_step(
-                prefix_pad_masks=prefix_pad_masks,
-                past_key_values=past_key_values,
-                x_t=x_t,
-                timestep=time_tensor,
-            )
+            if rtc is None:
+                v_t = self.denoise_step(
+                    prefix_pad_masks=prefix_pad_masks,
+                    past_key_values=past_key_values,
+                    x_t=x_t,
+                    timestep=time_tensor,
+                )
+            else:
+
+                def denoise(current_actions: torch.Tensor) -> torch.Tensor:
+                    return self.denoise_step(
+                        prefix_pad_masks=prefix_pad_masks,
+                        past_key_values=past_key_values,
+                        x_t=current_actions,
+                        timestep=time_tensor,
+                    )
+
+                v_t = guided_rtc_velocity(x_t, time_tensor, denoise, rtc)
             x_t = x_t + dt * v_t
         return x_t
 

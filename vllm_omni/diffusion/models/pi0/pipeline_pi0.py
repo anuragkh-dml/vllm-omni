@@ -24,6 +24,12 @@ from vllm_omni.diffusion.models.pi0.config import Pi0Config
 from vllm_omni.diffusion.models.pi0.modeling_pi0 import Pi0ForActionPrediction
 from vllm_omni.diffusion.models.pi0.processor_pi0 import build_model_inputs
 from vllm_omni.diffusion.models.pi0_pipeline_config import PI0_PIPELINE as PI0_PIPELINE
+from vllm_omni.diffusion.models.pi_rtc import (
+    RTC_EXTRA_ARG,
+    GuidedRTCRequest,
+    build_guided_rtc_batch,
+    parse_guided_rtc_request,
+)
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 logger = init_logger(__name__)
@@ -193,6 +199,7 @@ class Pi0Pipeline(nn.Module):
         valid_indices: list[int] = []
         inputs: list[tuple[list[torch.Tensor], list[torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]] = []
         noise_rows: list[torch.Tensor] = []
+        rtc_requests: list[GuidedRTCRequest | None] = []
         num_steps: int | None = None
 
         for index, request in enumerate(req.requests):
@@ -228,6 +235,12 @@ class Pi0Pipeline(nn.Module):
                 if valid_indices and (int(steps) if steps is not None else None) != num_steps:
                     raise ValueError("num_inference_steps differs from the current request batch.")
                 model_inputs = build_model_inputs(robot_obs, self.config, self.tokenizer, self._device)
+                rtc_request = parse_guided_rtc_request(
+                    extra_args.get(RTC_EXTRA_ARG),
+                    action_horizon=self.config.chunk_size,
+                    action_dim=self.config.max_action_dim,
+                    device=self._device,
+                )
                 generator = sampling.generator
                 if isinstance(generator, list):
                     if len(generator) != 1:
@@ -259,12 +272,12 @@ class Pi0Pipeline(nn.Module):
             valid_indices.append(index)
             inputs.append(model_inputs)
             noise_rows.append(noise_row)
+            rtc_requests.append(rtc_request)
             num_steps = int(steps) if steps is not None else None
 
         if valid_indices:
             images = [
-                torch.cat([item[0][camera] for item in inputs], dim=0)
-                for camera in range(self.config.max_cameras)
+                torch.cat([item[0][camera] for item in inputs], dim=0) for camera in range(self.config.max_cameras)
             ]
             image_masks = [
                 torch.cat([item[1][camera] for item in inputs], dim=0) for camera in range(self.config.max_cameras)
@@ -272,24 +285,52 @@ class Pi0Pipeline(nn.Module):
             lang_tokens = torch.cat([item[2] for item in inputs], dim=0)
             lang_masks = torch.cat([item[3] for item in inputs], dim=0)
             state = self.model._normalize_state(torch.cat([item[4] for item in inputs], dim=0))
+            rtc_batch = None
+            if any(request is not None for request in rtc_requests):
+                with torch.inference_mode(False):
+                    rtc_batch = build_guided_rtc_batch(
+                        rtc_requests,
+                        action_horizon=self.config.chunk_size,
+                        action_dim=self.config.max_action_dim,
+                        device=self._device,
+                    )
 
-            actions = self.model.sample_actions(
-                images=images,
-                image_masks=image_masks,
-                lang_tokens=lang_tokens,
-                lang_masks=lang_masks,
-                state=state,
-                noise=torch.stack(noise_rows),
-                num_steps=num_steps,
-            )
-            actions = self.model._unnormalize_actions(actions)
+            noise = torch.stack(noise_rows)
+            if rtc_batch is None:
+                model_actions = self.model.sample_actions(
+                    images=images,
+                    image_masks=image_masks,
+                    lang_tokens=lang_tokens,
+                    lang_masks=lang_masks,
+                    state=state,
+                    noise=noise,
+                    num_steps=num_steps,
+                )
+            else:
+                with torch.inference_mode(False):
+                    model_actions = self.model.sample_actions(
+                        images=images,
+                        image_masks=image_masks,
+                        lang_tokens=lang_tokens,
+                        lang_masks=lang_masks,
+                        state=state,
+                        noise=noise,
+                        num_steps=num_steps,
+                        rtc=rtc_batch,
+                    )
+            actions = self.model._unnormalize_actions(model_actions)
             expected_shape = (len(valid_indices), self.config.chunk_size, self.config.max_action_dim)
             if tuple(actions.shape) != expected_shape:
                 raise RuntimeError(
                     f"π0 model returned actions with shape {tuple(actions.shape)}, expected {expected_shape}."
                 )
             for row, index in enumerate(valid_indices):
-                outputs[index] = DiffusionOutput(output={"actions": actions[row].float().cpu().numpy()})
+                output: dict[str, object] = {"actions": actions[row].float().cpu().numpy()}
+                rtc_request = rtc_requests[row]
+                if rtc_request is not None:
+                    output["model_actions"] = model_actions[row].float().cpu().numpy()
+                    output["rtc"] = rtc_request.response_metadata()
+                outputs[index] = DiffusionOutput(output=output)
 
         assert all(output is not None for output in outputs)
         return [output for output in outputs if output is not None]

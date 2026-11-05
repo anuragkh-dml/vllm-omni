@@ -25,7 +25,7 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-ActionOutput: TypeAlias = np.ndarray | dict[str, np.ndarray]
+ActionOutput: TypeAlias = np.ndarray | dict[str, object]
 
 
 def _to_builtin_container(value: Any) -> Any:
@@ -289,6 +289,8 @@ class ServingRealtimeRobotOpenPI:
             sampling_params.seed = int(seed)
         if "num_inference_steps" in sampling:
             sampling_params.num_inference_steps = sampling["num_inference_steps"]
+        if "rtc" in sampling:
+            extra_args["rtc"] = sampling["rtc"]
         sampling_params.extra_args = extra_args
         return OmniDiffusionRequest(
             prompt=prompt,
@@ -305,6 +307,15 @@ class ServingRealtimeRobotOpenPI:
         actions = multimodal_output.get("actions")
         if actions is None:
             raise RuntimeError("Missing multimodal_output['actions'] in robot policy result")
+        if "model_actions" in multimodal_output:
+            rtc = multimodal_output.get("rtc")
+            if not isinstance(rtc, Mapping):
+                raise RuntimeError("RTC policy result is missing RTC metadata")
+            return {
+                "actions": np.asarray(actions, dtype=np.float32),
+                "model_actions": np.asarray(multimodal_output["model_actions"], dtype=np.float32),
+                "rtc": dict(rtc),
+            }
         if isinstance(actions, Mapping):
             return {str(key): np.asarray(value, dtype=np.float32) for key, value in actions.items()}
         return np.asarray(actions, dtype=np.float32)

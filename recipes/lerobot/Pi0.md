@@ -98,6 +98,12 @@ Camera keys must match the server's `image_feature_keys` (the checkpoint's
 `input_features` order). If your robot uses different camera names, set
 `model_config.image_key_map` in `pi0.yaml` to map raw obs keys → feature keys.
 
+The versioned `sampling_params.rtc` envelope opts a request into guided
+Real-Time Chunking and returns both canonical and normalized model-space
+actions. See the
+[OpenPI API](../../docs/serving/openpi_api.md#guided-real-time-chunking-for-pi-policies)
+for the alignment and response contract.
+
 ## Correctness
 
 π0's flow-matching kernel is bit-for-bit matched to the LeRobot `PI0Policy`

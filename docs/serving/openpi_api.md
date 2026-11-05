@@ -117,7 +117,7 @@ connect
 
 infer
   -> msgpack({"endpoint": "infer", "session_id": "...", "seed": <optional int>, ...observation})
-  <- msgpack(ndarray | dict[str, ndarray])
+  <- msgpack(ndarray | action-response mapping)
 
 reset
   -> msgpack({"endpoint": "reset"})
@@ -127,6 +127,43 @@ reset
 If `endpoint` is omitted, the server treats the message as `infer`. Each
 inference message produces one action response after the engine request
 completes; action tokens or intermediate tensors are not streamed.
+
+### Guided Real-Time Chunking for Pi policies
+
+The π0 and π0.5 deploy configurations advertise an `rtc` capability in the
+initial handshake. Guided RTC is strictly opt-in per request; the server does
+not enable it from latency measurements or keep the previous chunk in session
+state. A client opts in by carrying the previous normalized model-action chunk:
+
+```python
+{
+    # ...the current observation...
+    "sampling_params": {
+        "rtc": {
+            "schema_version": 1,
+            "mode": "guided",
+            "previous_actions": np.float32[action_horizon, action_dim],
+            "inference_delay": 2,
+            "execution_horizon": 10,
+            "prefix_attention_schedule": "linear",  # linear, exp, ones, or zeros
+            "max_guidance_weight": 10.0,
+            "correlation": {"generation": 42},
+        }
+    },
+}
+```
+
+`previous_actions` is the prior response's `model_actions`, aligned by the
+client to the current control step. Delay and horizon are action-step counts
+and must satisfy
+`0 <= inference_delay <= execution_horizon <= action_horizon`. The server
+applies the Pi guided-RTC VJP correction at every flow-matching step.
+
+An RTC response is a mapping with `actions` in the policy's canonical robot
+space, `model_actions` in normalized model space for the next request, and
+`rtc` metadata echoing the version, mode, and correlation values. Requests
+without `sampling_params.rtc` retain the legacy bare-array response and
+ordinary denoising path.
 
 NumPy arrays use the marker format implemented by `openpi-client`. The server
 also accepts the legacy vLLM NumPy marker representation on input. JSON text

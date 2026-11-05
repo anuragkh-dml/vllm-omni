@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Inference-only π0 (Pi-Zero) VLA math kernel for vllm-omni.
 
 A self-contained inference kernel: only the math that turns a robot observation
@@ -46,6 +46,8 @@ from transformers.models.paligemma.modeling_paligemma import (
     PaliGemmaForConditionalGeneration,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+
+from vllm_omni.diffusion.models.pi_rtc import GuidedRTCBatch, guided_rtc_velocity
 
 logger = logging.getLogger(__name__)
 
@@ -760,6 +762,7 @@ class Pi0ForActionPrediction(nn.Module):
         state: torch.Tensor,
         noise: torch.Tensor | None = None,
         num_steps: int | None = None,
+        rtc: GuidedRTCBatch | None = None,
     ) -> torch.Tensor:
         """Generate an action chunk via iterative flow-matching denoising.
 
@@ -772,6 +775,10 @@ class Pi0ForActionPrediction(nn.Module):
 
         bsize = state.shape[0]
         device = state.device
+        if rtc is not None:
+            # State participates in the differentiable suffix denoiser and may
+            # also have been created by the inference-mode pipeline.
+            state = state.clone()
         if noise is None:
             noise = torch.randn(
                 bsize,
@@ -780,6 +787,11 @@ class Pi0ForActionPrediction(nn.Module):
                 dtype=torch.float32,
                 device=device,
             )
+        elif rtc is not None:
+            # RTC is entered from an inference-mode pipeline. Autograd cannot
+            # attach to an inference tensor, so make one normal tensor before
+            # the denoising loop rather than copying at every RTC step.
+            noise = noise.clone()
 
         # 1. Prefix embeddings + mask building.
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
@@ -804,13 +816,26 @@ class Pi0ForActionPrediction(nn.Module):
         for step in range(num_steps):
             t = 1.0 + step * dt
             time_tensor = torch.full((bsize,), t, dtype=torch.float32, device=device)
-            v_t = self.denoise_step(
-                state=state,
-                prefix_pad_masks=prefix_pad_masks,
-                past_key_values=past_key_values,
-                x_t=x_t,
-                timestep=time_tensor,
-            )
+            if rtc is None:
+                v_t = self.denoise_step(
+                    state=state,
+                    prefix_pad_masks=prefix_pad_masks,
+                    past_key_values=past_key_values,
+                    x_t=x_t,
+                    timestep=time_tensor,
+                )
+            else:
+
+                def denoise(current_actions: torch.Tensor) -> torch.Tensor:
+                    return self.denoise_step(
+                        state=state,
+                        prefix_pad_masks=prefix_pad_masks,
+                        past_key_values=past_key_values,
+                        x_t=current_actions,
+                        timestep=time_tensor,
+                    )
+
+                v_t = guided_rtc_velocity(x_t, time_tensor, denoise, rtc)
             x_t = x_t + dt * v_t
         return x_t
 

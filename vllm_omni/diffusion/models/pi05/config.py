@@ -420,8 +420,7 @@ def load_lerobot_norm_stats(checkpoint_dir: str | Path) -> dict[str, dict[str, A
 # longer explanations.
 #
 # The predicate is per key because these are not all flags: ``n_obs_steps`` is
-# a count whose supported value is 1, and an empty ``rtc_config`` still selects
-# RTC — LeRobot's ``RTCConfig`` defaults ``enabled=True``.
+# a count whose supported value is 1.
 _UNSUPPORTED: dict[str, tuple[Callable[[Any], bool], str]] = {
     "use_peft": (bool, "adapter-aware loading; this loader takes a merged checkpoint only"),
     "empty_cameras": (bool, "mutates the input schema; declare camera features explicitly instead"),
@@ -429,10 +428,6 @@ _UNSUPPORTED: dict[str, tuple[Callable[[Any], bool], str]] = {
     "use_proprioceptive_memory": (
         bool,
         "MEM sends the state as a projected token, not the discretized prompt built here",
-    ),
-    "rtc_config": (
-        lambda value: value is not None,
-        "RTC needs prefix guidance in the denoising loop and per-request chunk carry-over",
     ),
     "n_obs_steps": (
         lambda value: bool(value) and value > 1,
@@ -466,6 +461,11 @@ def _reject_unsupported_capabilities(raw: dict[str, Any]) -> None:
     if delay:
         logger.info(
             "π0.5 config: checkpoint was trained with rtc_training_max_delay=%s. "
-            "Real-Time Chunking is not implemented here; serving proceeds without it.",
+            "RTC remains disabled unless a request carries sampling_params.rtc.",
             delay,
+        )
+    if raw.get("rtc_config") is not None:
+        logger.info(
+            "π0.5 config: checkpoint declares rtc_config. "
+            "RTC remains disabled unless a request carries sampling_params.rtc."
         )

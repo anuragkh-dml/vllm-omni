@@ -36,6 +36,12 @@ from vllm_omni.diffusion.models.pi05.config import SUPPORTED_DTYPE_NAMES, Pi05Co
 from vllm_omni.diffusion.models.pi05.modeling_pi05 import Pi05ForActionPrediction
 from vllm_omni.diffusion.models.pi05.processor_pi05 import Pi05Processor
 from vllm_omni.diffusion.models.pi05_pipeline_config import PI05_PIPELINE as PI05_PIPELINE
+from vllm_omni.diffusion.models.pi_rtc import (
+    RTC_EXTRA_ARG,
+    GuidedRTCRequest,
+    build_guided_rtc_batch,
+    parse_guided_rtc_request,
+)
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.platforms import current_omni_platform
 
@@ -287,11 +293,13 @@ class Pi05Pipeline(nn.Module):
         observations: list[Mapping] = []
         inputs: list[tuple[list[torch.Tensor], list[torch.Tensor], torch.Tensor, torch.Tensor]] = []
         generators: list[torch.Generator | None] = []
+        rtc_requests: list[GuidedRTCRequest | None] = []
         num_steps: int | None = None
 
         for index, request in enumerate(req.requests):
             sampling = request.sampling_params
-            robot_obs = (sampling.extra_args or {}).get("robot_obs")
+            extra_args = sampling.extra_args or {}
+            robot_obs = extra_args.get("robot_obs")
             if robot_obs is None:
                 prompt = request.prompt
                 if isinstance(prompt, str):
@@ -321,6 +329,12 @@ class Pi05Pipeline(nn.Module):
                 if valid_indices and (int(steps) if steps is not None else None) != num_steps:
                     raise ValueError("num_inference_steps differs from the current request batch.")
                 model_inputs = self.processor.build_model_inputs(robot_obs)
+                rtc_request = parse_guided_rtc_request(
+                    extra_args.get(RTC_EXTRA_ARG),
+                    action_horizon=self.config.chunk_size,
+                    action_dim=self.config.max_action_dim,
+                    device=self._device,
+                )
                 generator = sampling.generator
                 if isinstance(generator, list):
                     if len(generator) != 1:
@@ -338,12 +352,12 @@ class Pi05Pipeline(nn.Module):
             observations.append(robot_obs)
             inputs.append(model_inputs)
             generators.append(generator)
+            rtc_requests.append(rtc_request)
             num_steps = int(steps) if steps is not None else None
 
         if valid_indices:
             images = [
-                torch.cat([item[0][camera] for item in inputs], dim=0)
-                for camera in range(self.config.max_cameras)
+                torch.cat([item[0][camera] for item in inputs], dim=0) for camera in range(self.config.max_cameras)
             ]
             image_masks = [
                 torch.cat([item[1][camera] for item in inputs], dim=0) for camera in range(self.config.max_cameras)
@@ -351,6 +365,15 @@ class Pi05Pipeline(nn.Module):
             lang_tokens = torch.cat([item[2] for item in inputs], dim=0)
             lang_masks = torch.cat([item[3] for item in inputs], dim=0)
             model_generator = generators[0] if len(generators) == 1 else generators
+            rtc_batch = None
+            if any(request is not None for request in rtc_requests):
+                with torch.inference_mode(False):
+                    rtc_batch = build_guided_rtc_batch(
+                        rtc_requests,
+                        action_horizon=self.config.chunk_size,
+                        action_dim=self.config.max_action_dim,
+                        device=self._device,
+                    )
 
             telemetry_enabled = _benchmark_telemetry_enabled()
             start_event = end_event = None
@@ -367,14 +390,26 @@ class Pi05Pipeline(nn.Module):
             forward_start_ns = time.monotonic_ns() if telemetry_enabled else 0
             model_error: BaseException | None = None
             try:
-                actions = self.model.sample_actions(
-                    images=images,
-                    image_masks=image_masks,
-                    lang_tokens=lang_tokens,
-                    lang_masks=lang_masks,
-                    num_steps=num_steps,
-                    generator=model_generator,
-                )
+                if rtc_batch is None:
+                    actions = self.model.sample_actions(
+                        images=images,
+                        image_masks=image_masks,
+                        lang_tokens=lang_tokens,
+                        lang_masks=lang_masks,
+                        num_steps=num_steps,
+                        generator=model_generator,
+                    )
+                else:
+                    with torch.inference_mode(False):
+                        actions = self.model.sample_actions(
+                            images=images,
+                            image_masks=image_masks,
+                            lang_tokens=lang_tokens,
+                            lang_masks=lang_masks,
+                            num_steps=num_steps,
+                            generator=model_generator,
+                            rtc=rtc_batch,
+                        )
             except BaseException as exc:
                 model_error = exc
                 raise
@@ -392,7 +427,8 @@ class Pi05Pipeline(nn.Module):
                             cuda_sync_overhead_ms = (time.monotonic_ns() - sync_start_ns) / 1e6
                         peak_reserved_mb = (
                             current_omni_platform.max_memory_reserved() / (1024**2)
-                            if self._device.type == "cuda" else None
+                            if self._device.type == "cuda"
+                            else None
                         )
                     except Exception:
                         cuda_event_ms = cuda_sync_overhead_ms = peak_reserved_mb = None
@@ -402,9 +438,7 @@ class Pi05Pipeline(nn.Module):
                         event = {
                             "schema": "vllm_omni.pi05.sample_actions.v1",
                             "batch_id": uuid4().hex,
-                            "benchmark_request_ids": [
-                                _request_id(observation) for observation in observations
-                            ],
+                            "benchmark_request_ids": [_request_id(observation) for observation in observations],
                             "engine_request_ids": [req.requests[index].request_id for index in valid_indices],
                             "session_ids": [observation.get("session_id") for observation in observations],
                             "executed_batch_size": len(valid_indices),
@@ -442,7 +476,12 @@ class Pi05Pipeline(nn.Module):
             for row, index in enumerate(valid_indices):
                 try:
                     action = self.processor.build_model_outputs(actions[row : row + 1], observations[row])
-                    outputs[index] = DiffusionOutput(output={"actions": action})
+                    output: dict[str, object] = {"actions": action}
+                    rtc_request = rtc_requests[row]
+                    if rtc_request is not None:
+                        output["model_actions"] = actions[row].float().cpu().numpy()
+                        output["rtc"] = rtc_request.response_metadata()
+                    outputs[index] = DiffusionOutput(output=output)
                 except Exception as exc:  # Postprocessing uses this request's state.
                     outputs[index] = DiffusionOutput.from_exception(exc)
 
