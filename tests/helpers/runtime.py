@@ -1430,6 +1430,96 @@ def pi0_openpi_run_policy_session(
         conn.close()
 
 
+def pi0_openpi_run_rtc_request(
+    *,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+    path: str = PI0_OPENPI_PATH,
+    prompt: str = PI0_OPENPI_DEFAULT_PROMPT,
+    session_id: str | None = None,
+    num_inference_steps: int = 2,
+) -> dict[str, Any]:
+    """Send one guided RTC request through the real OpenPI websocket path."""
+    import uuid
+
+    import websockets.sync.client as websockets_client
+    from openpi_client import msgpack_numpy
+
+    session_id = session_id or str(uuid.uuid4())
+    correlation = {"generation": 1, "source": "gpu-e2e"}
+    payload = pi0_make_dummy_obs(prompt=prompt, session_id=session_id)
+    payload["sampling_params"] = {
+        "num_inference_steps": num_inference_steps,
+        "rtc": {
+            "schema_version": 1,
+            "mode": "guided",
+            "previous_actions": np.zeros((PI0_ACTION_HORIZON, PI0_ACTION_DIM), dtype=np.float32),
+            "inference_delay": 2,
+            "execution_horizon": 10,
+            "prefix_attention_schedule": "linear",
+            "max_guidance_weight": 10.0,
+            "correlation": correlation,
+        },
+    }
+    payload["endpoint"] = "infer"
+
+    uri = f"ws://{host}:{port}{path}"
+    conn = websockets_client.connect(uri, compression=None, max_size=None, ping_interval=300, ping_timeout=3600)
+    try:
+        metadata = msgpack_numpy.unpackb(conn.recv())
+        if not isinstance(metadata, dict):
+            raise TypeError(f"Expected dict metadata from server, got {type(metadata)!r}")
+        conn.send(msgpack_numpy.Packer().pack(payload))
+        raw_response = conn.recv()
+        if isinstance(raw_response, str):
+            raise RuntimeError(f"Inference failed: {raw_response}")
+        response = msgpack_numpy.unpackb(raw_response)
+        if isinstance(response, dict) and response.get("type") == "error":
+            raise RuntimeError(f"Inference failed: {response.get('message', response)}")
+        if not isinstance(response, dict):
+            raise TypeError(f"Expected RTC mapping response, got {type(response)!r}")
+        return {
+            "metadata": dict(metadata),
+            "response": dict(response),
+            "correlation": correlation,
+            "session_id": session_id,
+        }
+    finally:
+        conn.close()
+
+
+def pi0_openpi_validate_rtc_result(
+    result: dict[str, Any],
+    *,
+    expected_action_horizon: int = PI0_ACTION_HORIZON,
+    expected_action_dim: int = PI0_ACTION_DIM,
+) -> None:
+    """Assert the advertised RTC contract and dual-space action response."""
+    rtc_capability = result["metadata"].get("rtc")
+    if not isinstance(rtc_capability, dict):
+        raise AssertionError(f"Missing RTC handshake capability: {rtc_capability!r}")
+    if rtc_capability.get("schema_version") != 1:
+        raise AssertionError(f"Unexpected RTC schema version: {rtc_capability!r}")
+    if "guided" not in rtc_capability.get("modes", []):
+        raise AssertionError(f"Guided RTC not advertised: {rtc_capability!r}")
+
+    response = result["response"]
+    for key in ("actions", "model_actions"):
+        actions = np.asarray(response.get(key), dtype=np.float32)
+        if actions.shape != (expected_action_horizon, expected_action_dim):
+            raise AssertionError(f"RTC {key} shape mismatch: {actions.shape}")
+        if not np.isfinite(actions).all():
+            raise AssertionError(f"RTC {key} contains non-finite values")
+
+    rtc = response.get("rtc")
+    if not isinstance(rtc, dict):
+        raise AssertionError(f"Missing RTC response metadata: {rtc!r}")
+    if rtc.get("schema_version") != 1 or rtc.get("mode") != "guided":
+        raise AssertionError(f"Unexpected RTC response metadata: {rtc!r}")
+    if rtc.get("correlation") != result["correlation"]:
+        raise AssertionError(f"RTC correlation mismatch: {rtc.get('correlation')!r}")
+
+
 def pi0_openpi_validate_session_result(
     result: dict[str, Any],
     *,
@@ -1523,7 +1613,9 @@ __all__ = [
     "get_open_port",
     "dummy_messages_from_mix_data",
     "pi0_openpi_require_dependencies",
+    "pi0_openpi_run_rtc_request",
     "pi0_openpi_run_policy_session",
+    "pi0_openpi_validate_rtc_result",
     "pi0_openpi_validate_session_result",
     "pi0_make_dummy_obs",
 ]

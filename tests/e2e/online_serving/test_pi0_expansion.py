@@ -25,6 +25,8 @@ from tests.helpers.runtime import (
     get_open_port,
     pi0_openpi_require_dependencies,
     pi0_openpi_run_policy_session,
+    pi0_openpi_run_rtc_request,
+    pi0_openpi_validate_rtc_result,
     pi0_openpi_validate_session_result,
 )
 
@@ -83,3 +85,11 @@ def test_pi0_openpi_online(omni_server):
     assert metadata["needs_wrist_camera"] is True
     assert metadata["needs_session_id"] is False
     assert metadata["action_space"] == "joint_position"
+
+    rtc_result = pi0_openpi_run_rtc_request(
+        host=omni_server.host,
+        port=omni_server.port,
+        prompt="pick up the red block and place it in the bin",
+        session_id="pi0-rtc-e2e",
+    )
+    pi0_openpi_validate_rtc_result(rtc_result)
