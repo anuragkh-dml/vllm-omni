@@ -9,6 +9,7 @@ from abc import ABC, abstractmethod
 from collections import deque
 from collections.abc import Iterable
 from dataclasses import fields
+from typing import cast
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
@@ -64,7 +65,7 @@ class BaseScheduler(ABC):
         self._request_states: dict[str, SchedulerRequestState] = {}
         progress_path = os.environ.get("VLLM_OMNI_BENCH_STATUS_PATH")
         self._benchmark_progress = ProgressFeed(progress_path) if progress_path else None
-        self._benchmark_active_forward = None
+        self._benchmark_active_forward: dict[str, object] | None = None
         self._step_id: int = 0
         self._waiting: deque[str] = deque()
         self._running: list[str] = []
@@ -192,7 +193,7 @@ class BaseScheduler(ABC):
         if self._benchmark_progress is None:
             return
         active = self._benchmark_active_forward
-        active_internal = set(active["internal_request_ids"]) if active else set()
+        active_internal: set[str] = set(cast(tuple[str, ...], active["internal_request_ids"])) if active else set()
         queued_internal = tuple(dict.fromkeys((*self._running, *self._waiting)))
         queued = tuple(self._benchmark_progress_id(rid) for rid in queued_internal if rid not in active_internal)
         public_active = (

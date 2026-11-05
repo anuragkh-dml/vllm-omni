@@ -157,7 +157,9 @@ class _BatchRecordingPolicy(FakeGr00tPolicy):
         self.calls.append((obs, options))
         count = obs["video"]["cam"].shape[0]
         generators = options["generators"] if "generators" in options else [options["generator"]]
-        noise = np.array([torch.randn((), generator=item, device=item.device).item() for item in generators], dtype=np.float32)
+        noise = np.array(
+            [torch.randn((), generator=item, device=item.device).item() for item in generators], dtype=np.float32
+        )
         pixels = obs["video"]["cam"][:, 0, 0, 0, 0].astype(np.float32)
         states = obs["state"]["joint"][:, 0, 0]
         prompts = np.array([len(row[0]) for row in obs["language"][self.language_key]], dtype=np.float32)
@@ -175,13 +177,14 @@ def _batch_gr00t_pipeline():
 
 
 def _batch_gr00t_request(index, *, valid=True):
+    images = {"cam": np.full((1, 1, 8, 8, 3), 10 + index, dtype=np.uint8)}
     observation = {
-        "images": {"cam": np.full((1, 1, 8, 8, 3), 10 + index, dtype=np.uint8)},
+        "images": images,
         "state": {"joint": np.full((1, 1, 2), index + 1, dtype=np.float32)},
         "prompt": f"pick object {index}",
     }
     if not valid:
-        observation["images"]["cam"] = np.zeros((2, 1, 8, 8, 3), dtype=np.uint8)
+        images["cam"] = np.zeros((2, 1, 8, 8, 3), dtype=np.uint8)
     return OmniDiffusionRequest(
         prompt=observation["prompt"],
         request_id=f"gr00t-{index}",

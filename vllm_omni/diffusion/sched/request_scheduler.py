@@ -192,7 +192,7 @@ class RequestScheduler(BaseScheduler):
                     if member is None or member.contract != metadata.contract:
                         break
                     member_request_ids.append(request_id)
-                    obs = self._benchmark_trace_obs(self._request_states[request_id])
+                    obs = self._benchmark_observation(self._request_states[request_id])
                     if obs is not None:
                         obs[COHORT_RECEIPT_FIELD] = cohort_receipt(
                             close,
@@ -206,7 +206,7 @@ class RequestScheduler(BaseScheduler):
             actual = [request_id for request_id in member_request_ids if request_id in executed]
             if actual:
                 for request_id in actual:
-                    obs = self._benchmark_trace_obs(self._request_states[request_id])
+                    obs = self._benchmark_observation(self._request_states[request_id])
                     if obs is not None:
                         obs[COHORT_RECEIPT_FIELD]["executed_count"] = len(actual)
                 self._cohorts.close(close.epoch_id)
@@ -238,8 +238,8 @@ class RequestScheduler(BaseScheduler):
         # The request-level runner uses one first-step query boundary per wave.
         # The Manager already aligns all CFG sequences within each request.
         current = manager.get_metadata(self._running[0]).sequences[0].cached_prefix_len
-        candidate = manager.get_metadata(state.request_id).sequences[0].cached_prefix_len
-        return candidate == current
+        candidate_prefix_len = manager.get_metadata(state.request_id).sequences[0].cached_prefix_len
+        return candidate_prefix_len == current
 
     def get_admission_wait_decision(
         self,

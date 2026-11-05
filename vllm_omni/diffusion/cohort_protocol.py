@@ -5,10 +5,11 @@
 from __future__ import annotations
 
 import json
-import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from hashlib import sha256
+
+import regex as re
 
 COHORT_WIRE_FIELD = "vllm_omni_cohort"
 COHORT_WIRE_SCHEMA = "vllm_omni.cohort.v1"

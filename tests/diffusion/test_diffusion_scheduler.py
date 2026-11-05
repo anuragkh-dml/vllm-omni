@@ -5,6 +5,7 @@ import asyncio
 import queue
 import threading
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 import torch
@@ -2395,7 +2396,7 @@ def test_neutral_cohort_wire_schedules_exact_membership(monkeypatch):
     output = scheduler.schedule()
 
     assert _new_ids(output) == ["server-robot-a", "server-robot-b"]
-    receipts = [observation[COHORT_RECEIPT_FIELD] for observation in observations]
+    receipts = [cast(dict[str, object], observation[COHORT_RECEIPT_FIELD]) for observation in observations]
     assert {receipt["epoch_id"] for receipt in receipts} == {"route/epoch/7"}
     assert {receipt["executed_count"] for receipt in receipts} == {2}
     assert {receipt["close_reason"] for receipt in receipts} == {"expected_count"}

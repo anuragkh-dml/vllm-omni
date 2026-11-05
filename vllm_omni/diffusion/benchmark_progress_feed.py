@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Optional host-monotonic scheduler status for benchmark admission.
 
 Enabled only when VLLM_OMNI_BENCH_STATUS_PATH names a writable local file.
@@ -8,11 +11,11 @@ from __future__ import annotations
 
 import json
 import os
-from collections import deque
-from pathlib import Path
 import socket
 import threading
 import time
+from collections import deque
+from pathlib import Path
 
 
 class ProgressFeed:
@@ -32,7 +35,6 @@ class ProgressFeed:
         with self._lock:
             at_ns = time.monotonic_ns()
             previous_active = set(self._active["request_ids"]) if self._active else set()
-            current_active = set(active["request_ids"]) if active else set()
             previous_queued = set(self._queued)
             current_queued = set(queued)
             for request_id in sorted(current_queued - previous_queued - previous_active):
@@ -40,13 +42,21 @@ class ProgressFeed:
             for request_id in sorted(previous_queued - current_queued):
                 self._events.append({"at_ns": at_ns, "kind": "queue_leave", "request_id": request_id})
             if self._active is not None and self._active != active:
-                self._events.append({"at_ns": at_ns, "kind": "forward_end",
-                                     **{key: value for key, value in self._active.items()
-                                        if key != "internal_request_ids"}})
+                self._events.append(
+                    {
+                        "at_ns": at_ns,
+                        "kind": "forward_end",
+                        **{key: value for key, value in self._active.items() if key != "internal_request_ids"},
+                    }
+                )
             if active is not None and self._active != active:
-                self._events.append({"at_ns": at_ns, "kind": "forward_start",
-                                     **{key: value for key, value in active.items()
-                                        if key != "internal_request_ids"}})
+                self._events.append(
+                    {
+                        "at_ns": at_ns,
+                        "kind": "forward_start",
+                        **{key: value for key, value in active.items() if key != "internal_request_ids"},
+                    }
+                )
             self._active = active
             self._queued = queued
         self._wake.set()
@@ -54,8 +64,7 @@ class ProgressFeed:
     def record_cohort_close(self, details: dict) -> None:
         """Append a host-monotonic close event without blocking the scheduler on I/O."""
         with self._lock:
-            self._events.append({"at_ns": details["close_ns"],
-                                 "kind": "cohort_close", **details})
+            self._events.append({"at_ns": details["close_ns"], "kind": "cohort_close", **details})
         self._wake.set()
 
     def record_metadata_rejection(self, details: dict) -> None:
@@ -72,13 +81,15 @@ class ProgressFeed:
                 queued = self._queued
                 events = list(self._events)
             observed_ns = time.monotonic_ns()
-            payload = {"schema": "omni_scheduler_progress.v1",
-                       "clock_domain": "host_monotonic_ns",
-                       "hostname": self.hostname,
-                       "observed_ns": observed_ns,
-                       "active": active,
-                       "queued_request_ids": queued,
-                       "recent_events": events}
+            payload = {
+                "schema": "omni_scheduler_progress.v1",
+                "clock_domain": "host_monotonic_ns",
+                "hostname": self.hostname,
+                "observed_ns": observed_ns,
+                "active": active,
+                "queued_request_ids": queued,
+                "recent_events": events,
+            }
             temporary = self.path.with_name(self.path.name + f".{os.getpid()}.tmp")
             try:
                 temporary.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")

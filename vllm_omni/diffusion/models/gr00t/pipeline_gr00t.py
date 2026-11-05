@@ -221,9 +221,7 @@ class Gr00tN1d7Pipeline(nn.Module):
                         event = {
                             "schema": "vllm_omni.gr00t.get_action.v1",
                             "batch_id": uuid4().hex,
-                            "benchmark_request_ids": [
-                                _request_id(observation) for observation in wire_observations
-                            ],
+                            "benchmark_request_ids": [_request_id(observation) for observation in wire_observations],
                             "engine_request_ids": [req.requests[index].request_id for index in valid_indices],
                             "session_ids": [observation.get("session_id") for observation in wire_observations],
                             "executed_batch_size": len(valid_indices),
@@ -292,10 +290,7 @@ def _collate_observations(observations: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "video": {key: np.concatenate([obs["video"][key] for obs in observations], axis=0) for key in first["video"]},
         "state": {key: np.concatenate([obs["state"][key] for obs in observations], axis=0) for key in first["state"]},
-        "language": {
-            key: [row for obs in observations for row in obs["language"][key]]
-            for key in first["language"]
-        },
+        "language": {key: [row for obs in observations for row in obs["language"][key]] for key in first["language"]},
     }
 
 
@@ -318,9 +313,7 @@ def _noise_generator(
     if isinstance(generator, torch.Generator):
         return generator
     if generator is not None:
-        received = (
-            f"a list of {len(generator)} generators" if isinstance(generator, list) else type(generator).__name__
-        )
+        received = f"a list of {len(generator)} generators" if isinstance(generator, list) else type(generator).__name__
         logger.warning(
             "GR00T expects a single torch.Generator per request but got %s; ignoring it. The initial noise "
             "falls back to sampling_params.seed=%s, or to the global RNG when that is None.",
