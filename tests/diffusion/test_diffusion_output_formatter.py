@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -104,6 +105,37 @@ def test_formatter_preserves_single_video_audio_actions_and_metadata(
         "height": None,
         "num_inference_steps": 1,
     }
+
+
+def test_formatter_preserves_pi_rtc_payload(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(output_formatter, "supports_audio_output", lambda _: False)
+    actions = np.zeros((50, 32), dtype=np.float32)
+    model_actions = np.ones((50, 32), dtype=np.float32)
+    rtc = {
+        "schema_version": 1,
+        "mode": "guided",
+        "correlation": {"generation": 7},
+    }
+    postprocess_output = normalize_diffusion_postprocess_output(
+        {
+            "actions": actions,
+            "model_actions": model_actions,
+            "rtc": rtc,
+        }
+    )
+
+    [result] = format_diffusion_outputs(
+        request=_request("pick up the block"),
+        od_config=_config(),
+        diffusion_output=DiffusionOutput(output=None),
+        output_data={"actions": actions, "model_actions": model_actions, "rtc": rtc},
+        postprocess_output=postprocess_output,
+    )
+
+    assert result.multimodal_output is not None
+    np.testing.assert_array_equal(result.multimodal_output["actions"], actions)
+    np.testing.assert_array_equal(result.multimodal_output["model_actions"], model_actions)
+    assert result.multimodal_output["rtc"] == rtc
 
 
 def test_formatter_normalizes_payload_metadata_envelope(

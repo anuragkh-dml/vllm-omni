@@ -26,6 +26,8 @@ from vllm_omni.outputs.output_metadata import (
     validate_public_diffusion_metadata,
 )
 
+_MULTIMODAL_PAYLOAD_KEYS = frozenset(("audio", "actions", "trajectory", "model_actions", "rtc"))
+
 
 @dataclass(frozen=True)
 class DiffusionPostprocessOutput:
@@ -273,7 +275,7 @@ def _build_multimodal_output(
     if postprocess_output.metadata:
         mm_output["metadata"] = postprocess_output.metadata
     for key, value in postprocess_output.outputs.items():
-        if key in {"audio", "actions", "trajectory"}:
+        if key in _MULTIMODAL_PAYLOAD_KEYS:
             mm_output[key] = value
     if audio_sample_rate is not None:
         mm_output["audio_sample_rate"] = audio_sample_rate
