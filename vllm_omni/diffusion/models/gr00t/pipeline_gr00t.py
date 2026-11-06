@@ -13,6 +13,7 @@ import torch
 from torch import nn
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.benchmark_progress_feed import SCHEDULER_FORWARD_START_NS_FIELD
 from vllm_omni.diffusion.cohort_protocol import cohort_forward_telemetry
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
@@ -198,6 +199,17 @@ class Gr00tN1d7Pipeline(nn.Module):
                     start_event = end_event = None
                     logger.warning("GR00T benchmark CUDA timing unavailable", exc_info=True)
             forward_start_ns = time.monotonic_ns() if telemetry_enabled else 0
+            scheduler_starts = {
+                observation.get(SCHEDULER_FORWARD_START_NS_FIELD)
+                for observation in wire_observations
+            }
+            scheduler_forward_start_ns = (
+                next(iter(scheduler_starts))
+                if len(scheduler_starts) == 1
+                and type(next(iter(scheduler_starts))) is int
+                and next(iter(scheduler_starts)) > 0
+                else None
+            )
             model_error: BaseException | None = None
             try:
                 result = self.policy.get_action(policy_obs, options)
@@ -219,7 +231,7 @@ class Gr00tN1d7Pipeline(nn.Module):
                         logger.warning("GR00T benchmark CUDA timing unavailable", exc_info=True)
                     try:
                         event = {
-                            "schema": "vllm_omni.gr00t.get_action.v1",
+                            "schema": "vllm_omni.gr00t.get_action.v2",
                             "batch_id": uuid4().hex,
                             "benchmark_request_ids": [_request_id(observation) for observation in wire_observations],
                             "engine_request_ids": [req.requests[index].request_id for index in valid_indices],
@@ -232,6 +244,7 @@ class Gr00tN1d7Pipeline(nn.Module):
                             "scheduler_queue_wait_ms": [
                                 req.requests[index].scheduler_queue_wait_ms for index in valid_indices
                             ],
+                            "scheduler_forward_start_ns": scheduler_forward_start_ns,
                             "forward_start_ns": forward_start_ns,
                             "forward_end_ns": forward_end_ns,
                             "cpu_forward_ms": (forward_end_ns - forward_start_ns) / 1e6,

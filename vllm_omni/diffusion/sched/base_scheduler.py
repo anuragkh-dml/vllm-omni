@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import time
 from abc import ABC, abstractmethod
@@ -17,7 +18,12 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import RequestStatus
 
-from vllm_omni.diffusion.benchmark_progress_feed import ProgressFeed
+from vllm_omni.diffusion.benchmark_progress_feed import (
+    SCHEDULER_ACTIVE_TELEMETRY_MARKER,
+    SCHEDULER_ACTIVE_TELEMETRY_SCHEMA,
+    SCHEDULER_FORWARD_START_NS_FIELD,
+    ProgressFeed,
+)
 from vllm_omni.diffusion.cohort_protocol import COHORT_RECEIPT_FIELD
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
@@ -220,6 +226,9 @@ class BaseScheduler(ABC):
                 for rid in request_ids
                 if rid in self._request_states
             ]
+            for observation in observations:
+                if observation is not None:
+                    observation[SCHEDULER_FORWARD_START_NS_FIELD] = start_ns
             receipts = [obs.get(COHORT_RECEIPT_FIELD) if obs is not None else None for obs in observations]
             cohort_receipts = [receipt for receipt in receipts if isinstance(receipt, dict)]
             if (
@@ -254,6 +263,23 @@ class BaseScheduler(ABC):
         self._publish_benchmark_progress()
 
     def benchmark_forward_end(self) -> None:
+        active = self._benchmark_active_forward
+        end_ns = time.monotonic_ns()
+        if active is not None and os.environ.get("VLLM_OMNI_BENCH_BATCH_TELEMETRY") == "1":
+            event = {
+                "schema": SCHEDULER_ACTIVE_TELEMETRY_SCHEMA,
+                "forward_id": active["forward_id"],
+                "request_ids": active["request_ids"],
+                "start_ns": active["start_ns"],
+                "end_ns": end_ns,
+            }
+            try:
+                os.write(
+                    2,
+                    (SCHEDULER_ACTIVE_TELEMETRY_MARKER + json.dumps(event, separators=(",", ":")) + "\n").encode(),
+                )
+            except Exception:
+                logger.warning("Scheduler active-interval telemetry emission failed", exc_info=True)
         self._benchmark_active_forward = None
         self._publish_benchmark_progress()
 

@@ -30,6 +30,7 @@ import torch
 from torch import nn
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.benchmark_progress_feed import SCHEDULER_FORWARD_START_NS_FIELD
 from vllm_omni.diffusion.cohort_protocol import cohort_forward_telemetry
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.models.pi05.config import SUPPORTED_DTYPE_NAMES, Pi05Config
@@ -388,6 +389,17 @@ class Pi05Pipeline(nn.Module):
                     start_event = end_event = None
                     logger.warning("Pi05 benchmark CUDA timing unavailable", exc_info=True)
             forward_start_ns = time.monotonic_ns() if telemetry_enabled else 0
+            scheduler_starts = {
+                observation.get(SCHEDULER_FORWARD_START_NS_FIELD)
+                for observation in observations
+            }
+            scheduler_forward_start_ns = (
+                next(iter(scheduler_starts))
+                if len(scheduler_starts) == 1
+                and type(next(iter(scheduler_starts))) is int
+                and next(iter(scheduler_starts)) > 0
+                else None
+            )
             model_error: BaseException | None = None
             try:
                 if rtc_batch is None:
@@ -436,7 +448,7 @@ class Pi05Pipeline(nn.Module):
                     try:
                         od_config = getattr(self, "od_config", None)
                         event = {
-                            "schema": "vllm_omni.pi05.sample_actions.v1",
+                            "schema": "vllm_omni.pi05.sample_actions.v2",
                             "batch_id": uuid4().hex,
                             "benchmark_request_ids": [_request_id(observation) for observation in observations],
                             "engine_request_ids": [req.requests[index].request_id for index in valid_indices],
@@ -449,6 +461,7 @@ class Pi05Pipeline(nn.Module):
                             "scheduler_queue_wait_ms": [
                                 req.requests[index].scheduler_queue_wait_ms for index in valid_indices
                             ],
+                            "scheduler_forward_start_ns": scheduler_forward_start_ns,
                             "forward_start_ns": forward_start_ns,
                             "forward_end_ns": forward_end_ns,
                             "cpu_forward_ms": (forward_end_ns - forward_start_ns) / 1e6,

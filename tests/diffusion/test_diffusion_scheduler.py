@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import asyncio
+import json
+import os
 import queue
 import threading
 from types import SimpleNamespace
@@ -2402,7 +2404,14 @@ def test_neutral_cohort_wire_schedules_exact_membership(monkeypatch):
     assert {receipt["close_reason"] for receipt in receipts} == {"expected_count"}
 
 
-def test_benchmark_progress_resolves_request_ids_without_detailed_trace():
+def test_benchmark_progress_resolves_request_ids_without_detailed_trace(monkeypatch):
+    from vllm_omni.diffusion import benchmark_progress_feed
+    from vllm_omni.diffusion.benchmark_progress_feed import SCHEDULER_FORWARD_START_NS_FIELD
+
+    records = []
+    monkeypatch.setenv("VLLM_OMNI_BENCH_BATCH_TELEMETRY", "1")
+    monkeypatch.setattr(os, "write", lambda fd, payload: records.append((fd, payload)))
+
     scheduler = RequestScheduler()
     scheduler.initialize(OmniDiffusionConfig(max_num_seqs=2, request_batch_max_wait_ms=0.0))
     observation = {"request_id": "route/robot-a"}
@@ -2420,7 +2429,15 @@ def test_benchmark_progress_resolves_request_ids_without_detailed_trace():
     output = scheduler.schedule()
     scheduler.benchmark_forward_start(output)
     assert scheduler._benchmark_active_forward["request_ids"] == ("route/robot-a",)
+    assert observation[SCHEDULER_FORWARD_START_NS_FIELD] == scheduler._benchmark_active_forward["start_ns"]
     scheduler.benchmark_forward_end()
+    assert len(records) == 1 and records[0][0] == 2
+    event = json.loads(records[0][1].split(
+        benchmark_progress_feed.SCHEDULER_ACTIVE_TELEMETRY_MARKER.encode(), 1
+    )[1])
+    assert event["schema"] == benchmark_progress_feed.SCHEDULER_ACTIVE_TELEMETRY_SCHEMA
+    assert event["request_ids"] == ["route/robot-a"]
+    assert event["start_ns"] < event["end_ns"]
 
     scheduler.add_request(_make_step_request("server-warmup"))
     assert scheduler._benchmark_progress_id("server-warmup") == "server-warmup"
