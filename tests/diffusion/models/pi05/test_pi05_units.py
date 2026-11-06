@@ -1239,6 +1239,7 @@ def test_pi05_rtc_request_returns_canonical_and_model_space_actions():
 
 
 def test_pi05_benchmark_telemetry_names_only_executed_rows(monkeypatch):
+    from vllm_omni.diffusion.benchmark_progress_feed import SCHEDULER_FORWARD_START_NS_FIELD
     from vllm_omni.diffusion.models.pi05 import pipeline_pi05
 
     monkeypatch.setenv("VLLM_OMNI_BENCH_BATCH_TELEMETRY", "1")
@@ -1251,6 +1252,7 @@ def test_pi05_benchmark_telemetry_names_only_executed_rows(monkeypatch):
         obs = request.sampling_params.extra_args["robot_obs"]
         obs["request_id"] = f"benchmark-{index:032x}"
         obs["session_id"] = f"session-{index}"
+        obs[SCHEDULER_FORWARD_START_NS_FIELD] = 1
         request.scheduler_queue_wait_ms = index + 0.25
 
     outputs = pipeline.forward(DiffusionRequestBatch(requests))
@@ -1261,6 +1263,7 @@ def test_pi05_benchmark_telemetry_names_only_executed_rows(monkeypatch):
     assert len(records) == 1 and records[0][0] == 2
     assert records[0][1].startswith(b"BENCH_PI05_FORWARD ")
     event = json.loads(records[0][1].split(b"BENCH_PI05_FORWARD ", 1)[1])
+    assert event["schema"] == "vllm_omni.pi05.sample_actions.v2"
     assert event["executed_batch_size"] == pipeline.model.calls[0][0][0].shape[0] == 2
     assert event["benchmark_request_ids"] == [f"benchmark-{index:032x}" for index in (1, 2)]
     assert event["engine_request_ids"] == ["pi05-1", "pi05-2"]
@@ -1271,10 +1274,12 @@ def test_pi05_benchmark_telemetry_names_only_executed_rows(monkeypatch):
     assert event["status"] == "completed"
     assert event["cuda_event_ms"] is None and event["cuda_sync_overhead_ms"] is None
     assert 0 < event["forward_start_ns"] < event["forward_end_ns"]
+    assert event["scheduler_forward_start_ns"] == 1
     assert "actions" not in event and "state" not in event and "prompt" not in event
 
 
 def test_pi05_benchmark_telemetry_logs_failed_model_call(monkeypatch):
+    from vllm_omni.diffusion.benchmark_progress_feed import SCHEDULER_FORWARD_START_NS_FIELD
     from vllm_omni.diffusion.models.pi05 import pipeline_pi05
 
     monkeypatch.setenv("VLLM_OMNI_BENCH_BATCH_TELEMETRY", "1")
@@ -1290,6 +1295,7 @@ def test_pi05_benchmark_telemetry_logs_failed_model_call(monkeypatch):
     pipeline.model = FailingModel()
     request = _batch_pi05_request(0)
     request.sampling_params.extra_args["robot_obs"]["request_id"] = "benchmark-" + "a" * 32
+    request.sampling_params.extra_args["robot_obs"][SCHEDULER_FORWARD_START_NS_FIELD] = 1
     with pytest.raises(RuntimeError, match="model failed"):
         pipeline.forward(DiffusionRequestBatch([request]))
     assert len(records) == 1

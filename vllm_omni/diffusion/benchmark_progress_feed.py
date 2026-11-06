@@ -17,6 +17,10 @@ import time
 from collections import deque
 from pathlib import Path
 
+SCHEDULER_FORWARD_START_NS_FIELD = "_vllm_omni_benchmark_scheduler_forward_start_ns"
+SCHEDULER_ACTIVE_TELEMETRY_MARKER = "BENCH_OMNI_SCHEDULER_ACTIVE "
+SCHEDULER_ACTIVE_TELEMETRY_SCHEMA = "vllm_omni.scheduler_active.v1"
+
 
 class ProgressFeed:
     def __init__(self, path: str):
