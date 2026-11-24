@@ -195,6 +195,8 @@ def test_progress_snapshot_preserves_fifo_and_hides_external_ids(monkeypatch):
 
     output = scheduler.schedule()
     before_forward = scheduler.whole_cohort_progress("cohort-a", "robot-group")
+    assert before_forward["state"] == "scheduled"
+    assert scheduler.whole_cohort_progress("cohort-b", "robot-group")["state"] == "queued"
     assert before_forward["active_ids"] == []
     assert before_forward["active_forward_id"] is None
     assert before_forward["active_start_age_ns"] is None
@@ -214,9 +216,13 @@ def test_progress_snapshot_preserves_fifo_and_hides_external_ids(monkeypatch):
     assert running["sequence"] > snapshot["sequence"]
     scheduler.benchmark_forward_end()
     after_forward = scheduler.whole_cohort_progress("cohort-a", "robot-group")
+    queued_other = scheduler.whole_cohort_progress("cohort-b", "robot-group")
+    assert after_forward["state"] == "finished"
+    assert queued_other["state"] == "queued"
     assert after_forward["active_ids"] == []
     assert after_forward["active_forward_id"] is None
-    assert after_forward["queued_ids"][:4] == ["robot-a", "robot-b", "robot-c", "robot-d"]
+    assert after_forward["queued_ids"][:2] == ["robot-c", "robot-d"]
+    assert after_forward["queued_ids"][2:] == after_forward["external_queued_ids"]
     completed = after_forward["recent_completions"]
     assert completed[-1]["request_ids"] == ["robot-a", "robot-b"]
 

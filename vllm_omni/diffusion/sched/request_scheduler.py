@@ -106,6 +106,7 @@ class RequestScheduler(BaseScheduler):
         self._whole_cohort_members: dict[str, tuple[str, ...]] = {}
         self._whole_cohort_scopes: dict[str, str | None] = {}
         self._whole_request_scopes: dict[str, str | None] = {}
+        self._whole_completed_request_ids: set[str] = set()
         self._whole_request_scheduled_ns: dict[str, int] = {}
         self._whole_progress_sequence = 1 if os.environ.get("VLLM_OMNI_OPENPI_PROGRESS") == "1" else 0
         self._whole_progress_lock = threading.Lock()
@@ -130,6 +131,7 @@ class RequestScheduler(BaseScheduler):
             self._whole_cohort_members.clear()
             self._whole_cohort_scopes.clear()
             self._whole_request_scopes.clear()
+            self._whole_completed_request_ids.clear()
             self._whole_request_scheduled_ns.clear()
             self._whole_completion_events.clear()
         # A normal OpenPI reset is not a process restart. Preserve the dedicated
@@ -143,6 +145,7 @@ class RequestScheduler(BaseScheduler):
         self._cohort_queue_enter_ns.pop(request_id, None)
         self._whole_cohorts.pop(request_id, None)
         self._whole_request_scopes.pop(request_id, None)
+        self._whole_completed_request_ids.discard(request_id)
         self._whole_request_scheduled_ns.pop(request_id, None)
 
     def add_whole_cohort(
@@ -263,8 +266,9 @@ class RequestScheduler(BaseScheduler):
             raise ValueError("whole-cohort progress snapshot exceeds request bound")
         forward = getattr(self, "_benchmark_active_forward", None)
         forward_ids = set(forward.get("internal_request_ids", ())) if forward else set()
-        active_internal = tuple(rid for rid in running if rid in forward_ids)
-        scheduled_internal = tuple(rid for rid in running if rid not in forward_ids)
+        completed_internal = self._whole_completed_request_ids
+        active_internal = tuple(rid for rid in running if rid in forward_ids and rid not in completed_internal)
+        scheduled_internal = tuple(rid for rid in running if rid not in forward_ids and rid not in completed_internal)
         queued_internal = (*scheduled_internal, *waiting)
         scoped_members = {
             rid
@@ -395,6 +399,10 @@ class RequestScheduler(BaseScheduler):
             self._record_whole_cohort_progress(cohort_id)
 
     def benchmark_forward_start(self, output: DiffusionSchedulerOutput) -> None:
+        # A request can be scheduled again after a completed forward in engines
+        # with multiple execution waves. The new forward makes it live again.
+        for request_id in output.scheduled_request_ids:
+            self._whole_completed_request_ids.discard(request_id)
         super().benchmark_forward_start(output)
         self._publish_all_whole_cohort_progress()
 
@@ -402,6 +410,10 @@ class RequestScheduler(BaseScheduler):
         forward = getattr(self, "_benchmark_active_forward", None)
         if forward is not None:
             request_ids = tuple(forward.get("internal_request_ids", ()))
+            # Whole-cohort request-mode inference returns one terminal result per
+            # forward. The engine drains its payloads immediately afterward, so
+            # these members must not masquerade as queued work in that window.
+            self._whole_completed_request_ids.update(rid for rid in request_ids if rid in self._whole_request_scopes)
             scopes = {self._whole_request_scopes.get(rid) for rid in request_ids}
             progress_scope = next(iter(scopes)) if len(scopes) == 1 else None
             self._whole_completion_events[str(forward["forward_id"])] = {
