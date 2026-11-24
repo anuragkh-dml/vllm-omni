@@ -764,7 +764,8 @@ class DiffusionEngine:
                 progress_start = getattr(self.scheduler, "benchmark_forward_start", None)
                 progress_end = getattr(self.scheduler, "benchmark_forward_end", None)
                 if progress_start is not None:
-                    progress_start(sched_output)
+                    with self._cv:
+                        progress_start(sched_output)
                 try:
                     runner_output: BaseRunnerOutput = (
                         self.execute_fn(sched_output)
@@ -773,7 +774,8 @@ class DiffusionEngine:
                     )
                 finally:
                     if progress_end is not None:
-                        progress_end()
+                        with self._cv:
+                            progress_end()
                 self._poll_native_kv()
                 worker_execution_completed = True
             except Exception as exc:
@@ -1485,7 +1487,13 @@ class DiffusionEngine:
         request = self._prepare_request_for_admission(request)
         return self._add_prepared_request(request)
 
-    async def infer_whole_cohort(self, requests: list[OmniDiffusionRequest]) -> list[OmniRequestOutput | BaseException]:
+    async def infer_whole_cohort(
+        self,
+        requests: list[OmniDiffusionRequest],
+        *,
+        cohort_id: str | None = None,
+        reply_only_owner: str | None = None,
+    ) -> list[OmniRequestOutput | BaseException]:
         """Admit one complete nonstreaming request wave on the engine's owner loop."""
         scheduler = self.scheduler
         if (
@@ -1505,7 +1513,7 @@ class DiffusionEngine:
                     for request in prepared:
                         request.cancellation_signal = self._request_cancellations.create(request.request_id)
                         registered.append(request.request_id)
-                ids = scheduler.add_whole_cohort(prepared)
+                ids = scheduler.add_whole_cohort(prepared, cohort_id=cohort_id, reply_only_owner=reply_only_owner)
             except BaseException:
                 if self._request_cancellations is not None:
                     for rid in registered:

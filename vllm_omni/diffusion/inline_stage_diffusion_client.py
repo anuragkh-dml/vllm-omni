@@ -119,10 +119,36 @@ class InlineStageDiffusionClient(StageClientBase):
             else 0
         )
 
-    async def infer_whole_cohort(self, requests: list[OmniDiffusionRequest]) -> list[OmniRequestOutput | BaseException]:
+    async def infer_whole_cohort(
+        self,
+        requests: list[OmniDiffusionRequest],
+        *,
+        cohort_id: str | None = None,
+        reply_only_owner: str | None = None,
+    ) -> list[OmniRequestOutput | BaseException]:
         if not 1 <= len(requests) <= self.whole_cohort_capacity or self._shutting_down or self._engine_dead:
             raise ValueError("whole-cohort replica unavailable or incompatible")
-        return await self._engine.infer_whole_cohort(requests)
+        return await self._engine.infer_whole_cohort(requests, cohort_id=cohort_id, reply_only_owner=reply_only_owner)
+
+    def whole_cohort_progress(self, cohort_id: str) -> dict[str, object]:
+        with self._engine._cv:
+            return self._engine.scheduler.whole_cohort_progress(cohort_id)
+
+    def whole_cohort_progress_snapshot(self) -> dict[str, object]:
+        with self._engine._cv:
+            return self._engine.scheduler.whole_cohort_progress_snapshot()
+
+    def reply_only_is_idle(self) -> bool:
+        with self._engine._cv:
+            return self._engine.scheduler.reply_only_is_idle()
+
+    def fence_reply_only(self, owner_id: str) -> None:
+        with self._engine._cv:
+            self._engine.scheduler.fence_reply_only(owner_id)
+
+    def complete_reply_only_cohort(self, cohort_id: str, owner_id: str, *, terminal_received: bool) -> None:
+        with self._engine._cv:
+            self._engine.scheduler.complete_reply_only_cohort(cohort_id, owner_id, terminal_received=terminal_received)
 
     async def add_request_async(
         self,

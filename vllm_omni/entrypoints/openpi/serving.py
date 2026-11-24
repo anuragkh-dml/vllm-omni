@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
 from itertools import count
@@ -29,6 +30,8 @@ logger = init_logger(__name__)
 
 ActionOutput: TypeAlias = np.ndarray | dict[str, object]
 WHOLE_COHORT_SCHEMA = "vllm_omni.infer_cohort.v1"
+WHOLE_COHORT_PROGRESS_SCHEMA = "vllm_omni.infer_cohort_progress.v1"
+REPLY_ONLY_SCHEMA = "vllm_omni.reply_only.v1"
 MAX_COHORT_SESSIONS = 1024
 
 
@@ -98,6 +101,10 @@ class ServingRealtimeRobotOpenPI:
         self.prompt_builder = self._load_prompt_builder(engine_client, policy_model_config, self.policy_server_config)
         self._request_counter = count()
         self._cohort_session_sequences: dict[str, int] = {}
+        self._process_generation = uuid.uuid4().hex
+        self._reply_only_owner: str | None = None
+        self._reply_only_cohort: str | None = None
+        self._reply_only_fenced = False
 
     def _whole_cohort_replica(self):
         # Use the existing inline stage and its owning event loop. Other
@@ -117,12 +124,111 @@ class ServingRealtimeRobotOpenPI:
         replica = self._whole_cohort_replica()
         return min(replica.whole_cohort_capacity, 1024) if replica is not None else 0
 
-    async def infer_whole_cohort(self, cohort_id: str, members: list[dict]) -> list[ActionOutput | None]:
+    @property
+    def progress_capability(self) -> bool:
+        return (
+            os.environ.get("VLLM_OMNI_OPENPI_PROGRESS") == "1"
+            and bool(os.environ.get("VLLM_OMNI_STATUS_INSTANCE"))
+            and self.whole_cohort_capacity > 0
+        )
+
+    def progress_handshake(self) -> dict[str, object] | None:
+        if not self.progress_capability:
+            return None
+        replica = self._whole_cohort_replica()
+        initial = replica.whole_cohort_progress_snapshot()
+        return {
+            "schema": WHOLE_COHORT_PROGRESS_SCHEMA,
+            "instance_id": os.environ["VLLM_OMNI_STATUS_INSTANCE"],
+            "generation": self._process_generation,
+            "initial": initial,
+        }
+
+    def whole_cohort_progress(
+        self,
+        cohort_id: str | None,
+        poll_sequence: int,
+        admission_pending_ids: list[str] | None = None,
+    ) -> dict[str, object]:
+        if not self.progress_capability:
+            raise ValueError("in-band OpenPI progress is unavailable")
+        replica = self._whole_cohort_replica()
+        try:
+            snapshot = (
+                replica.whole_cohort_progress_snapshot()
+                if cohort_id is None
+                else replica.whole_cohort_progress(cohort_id)
+            )
+        except KeyError:
+            if cohort_id is None or admission_pending_ids is None:
+                return {
+                    "type": "progress_error",
+                    "schema": WHOLE_COHORT_PROGRESS_SCHEMA,
+                    "instance_id": os.environ["VLLM_OMNI_STATUS_INSTANCE"],
+                    "generation": self._process_generation,
+                    "cohort_id": cohort_id,
+                    "poll_sequence": poll_sequence,
+                    "reason": "unknown_cohort",
+                }
+            # The poll may overtake request conversion and scheduler admission.
+            # Report that explicit phase with the actual global scheduler view;
+            # do not pretend the pending IDs are already queued at the backend.
+            snapshot = replica.whole_cohort_progress_snapshot()
+            snapshot["cohort_id"] = cohort_id
+            snapshot["state"] = "admitting"
+            snapshot["admission_pending_ids"] = admission_pending_ids
+        snapshot.setdefault("admission_pending_ids", [])
+        return {
+            "type": "progress",
+            "schema": WHOLE_COHORT_PROGRESS_SCHEMA,
+            "instance_id": os.environ["VLLM_OMNI_STATUS_INSTANCE"],
+            "generation": self._process_generation,
+            "cohort_id": cohort_id,
+            "poll_sequence": poll_sequence,
+            **snapshot,
+        }
+
+    def reply_only_handshake(self) -> dict[str, object] | None:
+        instance = os.environ.get("VLLM_OMNI_OPENPI_REPLY_ONLY_INSTANCE")
+        replica = self._whole_cohort_replica()
+        if (
+            os.environ.get("VLLM_OMNI_OPENPI_REPLY_ONLY_EXCLUSIVE") != "1"
+            or not isinstance(instance, str)
+            or not 1 <= len(instance) <= 256
+            or replica is None
+            or self.whole_cohort_capacity <= 0
+            or self._reply_only_fenced
+            or getattr(replica._engine.scheduler, "_reply_only_fenced", True)
+            or not getattr(replica._engine.scheduler, "_reply_only_required", False)
+        ):
+            return None
+        if not replica.reply_only_is_idle():
+            return None
+        return {
+            "schema": REPLY_ONLY_SCHEMA,
+            "instance_id": instance,
+            "generation": self._process_generation,
+            "capacity": 1,
+            "idle": True,
+        }
+
+    async def infer_whole_cohort(
+        self,
+        cohort_id: str,
+        members: list[dict],
+        *,
+        owner_id: str | None = None,
+        progress: bool = False,
+    ) -> list[ActionOutput | None]:
         replica = self._whole_cohort_replica()
         if replica is None or not 1 <= len(members) <= self.whole_cohort_capacity:
             raise ValueError("whole-cohort inference is unavailable or beyond replica capacity")
         if not isinstance(cohort_id, str) or not 1 <= len(cohort_id) <= 256:
             raise ValueError("invalid whole-cohort identity")
+        if progress and not self.progress_capability:
+            raise ValueError("whole-cohort progress was requested without negotiated capability")
+        if owner_id is None and self.reply_only_handshake() is not None:
+            raise ValueError("dedicated reply-only inference requires an owner lease")
         requests = []
         advances = {}
         ids = set()
@@ -149,13 +255,34 @@ class ServingRealtimeRobotOpenPI:
             ids.add(rid)
         if len(self._cohort_session_sequences.keys() | advances.keys()) > MAX_COHORT_SESSIONS:
             raise ValueError("whole-cohort session registry is full")
+        if owner_id is not None:
+            capability = self.reply_only_handshake()
+            if (
+                capability is None
+                or not isinstance(owner_id, str)
+                or not 1 <= len(owner_id) <= 256
+                or (self._reply_only_owner is not None and self._reply_only_owner != owner_id)
+                or self._reply_only_fenced
+                or self._reply_only_cohort is not None
+            ):
+                raise ValueError("reply-only owner lease is unavailable")
+            self._reply_only_owner = owner_id
+            self._reply_only_cohort = cohort_id
         # Retain per-session high-water marks across sockets, including after
         # cancellation. Eviction would silently allow a replay.
         self._cohort_session_sequences.update(advances)
         engine = self.engine_client.engine
-        results = await asyncio.wrap_future(
-            asyncio.run_coroutine_threadsafe(replica.infer_whole_cohort(requests), engine.orchestrator_loop)
-        )
+        try:
+            results = await asyncio.wrap_future(
+                asyncio.run_coroutine_threadsafe(
+                    replica.infer_whole_cohort(requests, cohort_id=cohort_id, reply_only_owner=owner_id),
+                    engine.orchestrator_loop,
+                )
+            )
+        except BaseException:
+            if owner_id is not None:
+                self._reply_only_fenced = True
+            raise
         actions = []
         for result in results:
             try:
@@ -163,6 +290,23 @@ class ServingRealtimeRobotOpenPI:
             except RuntimeError:
                 actions.append(None)
         return actions
+
+    def complete_reply_only_cohort(self, cohort_id: str, owner_id: str, *, terminal_received: bool) -> None:
+        if self._reply_only_cohort != cohort_id or self._reply_only_owner != owner_id:
+            if not terminal_received:
+                return
+            raise ValueError("reply-only terminal identity mismatch")
+        replica = self._whole_cohort_replica()
+        try:
+            replica.complete_reply_only_cohort(cohort_id, owner_id, terminal_received=terminal_received)
+        except ValueError:
+            if terminal_received:
+                raise
+            replica.fence_reply_only(owner_id)
+        if terminal_received:
+            self._reply_only_cohort = None
+        else:
+            self._reply_only_fenced = True
 
     @classmethod
     def create_policy_server(

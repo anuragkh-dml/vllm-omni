@@ -3,8 +3,13 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import os
+import threading
 import time
+import uuid
+from collections import OrderedDict
 from dataclasses import asdict, fields
 from typing import TYPE_CHECKING
 
@@ -36,6 +41,8 @@ if TYPE_CHECKING:
 
 # LoRA identity is derived from `sampling.lora_request`, not a same-named field
 # on sampling params, so it must be resolved separately from the bulk lookup.
+_MAX_WHOLE_PROGRESS_REQUESTS = 4096
+
 _REQUEST_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES = frozenset(
     field.name for field in fields(RequestBatchSamplingParamsKey)
 ) - {"condition_key", "flow_shift", "lora_int_id", "sample_solver"}
@@ -95,6 +102,18 @@ class RequestScheduler(BaseScheduler):
         self._cohort_configured_timeout_ns: int | None = None
         self._cohort_pending_close: CohortClose | None = None
         self._whole_cohorts: dict[str, tuple[str, ...]] = {}
+        self._whole_progress: dict[str, dict[str, object]] = {}
+        self._whole_cohort_members: dict[str, tuple[str, ...]] = {}
+        self._whole_request_scheduled_ns: dict[str, int] = {}
+        self._whole_progress_sequence = 0
+        self._whole_progress_lock = threading.Lock()
+        self._whole_completion_events: OrderedDict[str, dict[str, object]] = OrderedDict()
+        self._whole_progress_enabled = os.environ.get("VLLM_OMNI_OPENPI_PROGRESS") == "1"
+        self._reply_only_owner: str | None = None
+        self._reply_only_cohort: str | None = None
+        self._reply_only_fenced = False
+        self._reply_only_required = os.environ.get("VLLM_OMNI_OPENPI_REPLY_ONLY_EXCLUSIVE") == "1"
+        self._whole_progress_salt = uuid.uuid4().bytes if self._whole_progress_enabled else b""
 
     def _reset_scheduler_state(self) -> None:
         super()._reset_scheduler_state()
@@ -104,19 +123,45 @@ class RequestScheduler(BaseScheduler):
         self._cohort_configured_timeout_ns = None
         self._cohort_pending_close = None
         self._whole_cohorts.clear()
+        with self._whole_progress_lock:
+            self._whole_progress.clear()
+            self._whole_cohort_members.clear()
+            self._whole_request_scheduled_ns.clear()
+            self._whole_completion_events.clear()
+            self._whole_progress_sequence = 0
+        # A normal OpenPI reset is not a process restart. Preserve the dedicated
+        # owner fence, and fence any lease whose in-flight request was reset.
+        if self._reply_only_required and self._reply_only_cohort is not None:
+            self._reply_only_fenced = True
 
     def _pop_extra_request_state(self, request_id: str) -> None:
         super()._pop_extra_request_state(request_id)
         self._request_cohort.pop(request_id, None)
         self._cohort_queue_enter_ns.pop(request_id, None)
         self._whole_cohorts.pop(request_id, None)
+        self._whole_request_scheduled_ns.pop(request_id, None)
 
-    def add_whole_cohort(self, requests: list[OmniDiffusionRequest]) -> tuple[str, ...]:
+    def add_whole_cohort(
+        self,
+        requests: list[OmniDiffusionRequest],
+        *,
+        cohort_id: str | None = None,
+        reply_only_owner: str | None = None,
+    ) -> tuple[str, ...]:
         """Validate every member before making the ready group visible to scheduling."""
         ids = tuple(request.request_id for request in requests)
+        observed_cohort_id = (requests[0].sampling_params.extra_args or {}).get("whole_cohort_id") if requests else None
+        cohort_id = cohort_id or observed_cohort_id
+        if cohort_id is None and requests:
+            # Preserve the scheduler's original cohort-less Python API. Serving
+            # clients provide an explicit wire cohort ID; local callers get a
+            # bounded process-unique identity for scheduler ownership only.
+            cohort_id = f"local:{uuid.uuid4().hex}"
         if (
             not 1 <= len(ids) <= self.max_num_running_reqs
             or len(set(ids)) != len(ids)
+            or not isinstance(cohort_id, str)
+            or not cohort_id
             or any(rid in self._request_states or rid in self._kv_draining_requests for rid in ids)
             or self._diffusion_kv_manager is not None
         ):
@@ -124,6 +169,26 @@ class RequestScheduler(BaseScheduler):
         states = [self._make_request_state(rid, req) for rid, req in zip(ids, requests, strict=True)]
         if any(state.sampling_params_key != states[0].sampling_params_key for state in states[1:]):
             raise ValueError("whole cohort has incompatible sampling parameters")
+        if reply_only_owner is not None:
+            if not isinstance(reply_only_owner, str) or not 1 <= len(reply_only_owner) <= 256:
+                raise ValueError("invalid reply-only owner identity")
+            if not self._reply_only_required:
+                raise ValueError("reply-only owner supplied to a shared scheduler")
+            if (
+                self._reply_only_fenced
+                or (self._reply_only_owner is not None and self._reply_only_owner != reply_only_owner)
+                or self._reply_only_cohort is not None
+                or self._running
+                or self._waiting
+                or self._kv_draining_requests
+            ):
+                raise ValueError("reply-only scheduler is occupied or fenced")
+            self._reply_only_owner = reply_only_owner
+            self._reply_only_cohort = cohort_id
+        elif self._reply_only_owner is not None:
+            raise ValueError("scheduler is leased to a reply-only owner")
+        elif self._reply_only_required:
+            raise ValueError("dedicated reply-only scheduler requires an owner lease")
         queued_at = time.perf_counter()
         for state in states:
             rid = state.request_id
@@ -131,8 +196,190 @@ class RequestScheduler(BaseScheduler):
             self._request_states[rid] = state
             self._whole_cohorts[rid] = ids
         self._waiting.extend(ids)
+        if self._whole_progress_enabled:
+            self._whole_cohort_members[cohort_id] = ids
+            self._record_whole_cohort_progress(cohort_id)
         self._publish_benchmark_progress()
         return ids
+
+    def whole_cohort_progress(self, cohort_id: str) -> dict[str, object]:
+        """Return a fresh, causally correlated snapshot for one whole cohort."""
+        if not self._whole_progress_enabled:
+            raise RuntimeError("whole-cohort progress is not enabled")
+        with self._whole_progress_lock:
+            if cohort_id not in self._whole_cohort_members:
+                raise KeyError("unknown whole cohort")
+        return self._build_whole_cohort_progress_snapshot(cohort_id)
+
+    def whole_cohort_progress_snapshot(self) -> dict[str, object]:
+        """Return current replica activity without exposing other cohort IDs."""
+        if not self._whole_progress_enabled:
+            raise RuntimeError("whole-cohort progress is not enabled")
+        return self._build_whole_cohort_progress_snapshot(None)
+
+    def _build_whole_cohort_progress_snapshot(self, cohort_id: str | None) -> dict[str, object]:
+        # Callers hold the engine condition lock so scheduler collections and the
+        # forward marker form one projection. Preserve queue order: the estimator
+        # uses positions to reason about work ahead of the requested cohort.
+        running = tuple(self._running)
+        waiting = tuple(self._waiting)
+        if len(running) + len(waiting) > _MAX_WHOLE_PROGRESS_REQUESTS:
+            raise ValueError("whole-cohort progress snapshot exceeds request bound")
+        forward = getattr(self, "_benchmark_active_forward", None)
+        forward_ids = set(forward.get("internal_request_ids", ())) if forward else set()
+        members = set(self._whole_cohort_members.get(cohort_id, ())) if cohort_id else set()
+        now_ns = time.monotonic_ns()
+        active_ids = [
+            self._benchmark_progress_id(rid) if rid in members else self._opaque_progress_id(rid) for rid in running
+        ]
+        queued_ids = [
+            self._benchmark_progress_id(rid) if rid in members else self._opaque_progress_id(rid) for rid in waiting
+        ]
+        if cohort_id is None:
+            state = "running" if forward else "scheduled" if running else "queued" if waiting else "idle"
+        elif forward and members.intersection(forward_ids):
+            state = "running"
+        elif members.intersection(running):
+            state = "scheduled"
+        elif members.intersection(waiting):
+            state = "queued"
+        else:
+            state = "finished"
+
+        if forward:
+            active_start_age_ns = max(0, now_ns - int(forward["start_ns"]))
+        else:
+            scheduled = [
+                self._whole_request_scheduled_ns[rid] for rid in running if rid in self._whole_request_scheduled_ns
+            ]
+            active_start_age_ns = max(0, now_ns - min(scheduled)) if scheduled else None
+
+        active_groups = {self._whole_cohorts[rid] for rid in running if rid in self._whole_cohorts}
+        queued_groups = {self._whole_cohorts[rid] for rid in waiting if rid in self._whole_cohorts}
+        external_active = [rid for rid in running if rid not in members]
+        external_queued = [rid for rid in waiting if rid not in members]
+        completions = []
+        for forward_id, event in self._whole_completion_events.items():
+            completion_ids = event["request_ids"]
+            is_owned_completion = bool(
+                cohort_id is not None and members.intersection(event.get("internal_request_ids", ()))
+            )
+            completions.append(
+                {
+                    "forward_id": forward_id,
+                    "request_ids": (
+                        list(completion_ids)
+                        if is_owned_completion
+                        else [self._opaque_progress_id(rid) for rid in completion_ids]
+                    ),
+                    "age_ns": max(0, now_ns - int(event["ended_ns"])),
+                }
+            )
+        return {
+            "cohort_id": cohort_id,
+            "state": state,
+            "active_forward_id": forward.get("forward_id") if forward else None,
+            "active_ids": active_ids,
+            "queued_ids": queued_ids,
+            "active_start_age_ns": active_start_age_ns,
+            "active_cohort_count": len(active_groups),
+            "queued_cohort_count": len(queued_groups),
+            "external_active_count": len(external_active),
+            "external_queued_count": len(external_queued),
+            "external_active_ids": [self._opaque_progress_id(rid) for rid in external_active],
+            "external_queued_ids": [self._opaque_progress_id(rid) for rid in external_queued],
+            "recent_completions": completions[-32:],
+            "sequence": self._whole_progress_sequence,
+            "observed_ns": now_ns,
+        }
+
+    def reply_only_is_idle(self) -> bool:
+        """Prove the dedicated scheduler has no competing or in-flight work."""
+        return (
+            self._reply_only_required
+            and not self._reply_only_fenced
+            and self._reply_only_cohort is None
+            and not self._running
+            and not self._waiting
+            and not self._kv_draining_requests
+            and getattr(self, "_benchmark_active_forward", None) is None
+        )
+
+    def complete_reply_only_cohort(self, cohort_id: str, owner_id: str, *, terminal_received: bool) -> None:
+        """Release a dedicated scheduler only after its reply delivery is certain."""
+        if self._reply_only_cohort != cohort_id or self._reply_only_owner != owner_id:
+            if terminal_received:
+                raise ValueError("reply-only lease identity mismatch")
+            self.fence_reply_only(owner_id)
+            return
+        if terminal_received:
+            self._reply_only_cohort = None
+        else:
+            self._reply_only_fenced = True
+
+    def fence_reply_only(self, owner_id: str) -> None:
+        """Fail closed after an ambiguous exclusive-owner exchange."""
+        if not self._reply_only_required:
+            raise ValueError("cannot fence a shared scheduler as reply-only")
+        if self._reply_only_owner is None:
+            self._reply_only_owner = owner_id
+        self._reply_only_fenced = True
+
+    def _record_whole_cohort_progress(self, changed_cohort_id: str) -> None:
+        if not self._whole_progress_enabled:
+            return
+        # This function is called under the engine condition lock. Store only a
+        # compact transition projection; each poll takes a fresh timestamp and
+        # age projection without advancing the event sequence.
+        snapshot = self._build_whole_cohort_progress_snapshot(changed_cohort_id)
+        comparable = {key: value for key, value in snapshot.items() if key not in {"observed_ns", "sequence"}}
+        with self._whole_progress_lock:
+            previous = self._whole_progress.get(changed_cohort_id)
+            if previous is not None and all(previous.get(key) == value for key, value in comparable.items()):
+                return
+            self._whole_progress_sequence += 1
+            self._whole_progress[changed_cohort_id] = {
+                **comparable,
+                "sequence": self._whole_progress_sequence,
+                "observed_ns": time.monotonic_ns(),
+            }
+            if len(self._whole_progress) > 1024:
+                oldest = next(iter(self._whole_progress))
+                if oldest != changed_cohort_id:
+                    self._whole_progress.pop(oldest, None)
+                    self._whole_cohort_members.pop(oldest, None)
+
+    def _opaque_progress_id(self, request_id: str) -> str:
+        digest = hmac.new(self._whole_progress_salt, request_id.encode(), hashlib.sha256).hexdigest()
+        return f"external:{digest[:24]}"
+
+    def _publish_all_whole_cohort_progress(self) -> None:
+        for cohort_id in tuple(self._whole_cohort_members):
+            self._record_whole_cohort_progress(cohort_id)
+
+    def benchmark_forward_start(self, output: DiffusionSchedulerOutput) -> None:
+        super().benchmark_forward_start(output)
+        self._publish_all_whole_cohort_progress()
+
+    def benchmark_forward_end(self) -> None:
+        forward = getattr(self, "_benchmark_active_forward", None)
+        if forward is not None:
+            cohort_ids = {
+                str((self._request_states[rid].req.sampling_params.extra_args or {}).get("whole_cohort_id"))
+                for rid in forward.get("internal_request_ids", ())
+                if rid in self._request_states
+                and (self._request_states[rid].req.sampling_params.extra_args or {}).get("whole_cohort_id")
+            }
+            self._whole_completion_events[str(forward["forward_id"])] = {
+                "request_ids": tuple(forward.get("request_ids", ())),
+                "internal_request_ids": tuple(forward.get("internal_request_ids", ())),
+                "cohort_ids": tuple(sorted(cohort_ids)),
+                "ended_ns": time.monotonic_ns(),
+            }
+            while len(self._whole_completion_events) > 64:
+                self._whole_completion_events.popitem(last=False)
+        super().benchmark_forward_end()
+        self._publish_all_whole_cohort_progress()
 
     def finish_requests(self, request_ids: str | list[str], status: DiffusionRequestStatus) -> None:
         ids = [request_ids] if isinstance(request_ids, str) else request_ids
@@ -144,6 +391,7 @@ class RequestScheduler(BaseScheduler):
             for member in (self._whole_cohorts.get(rid, (rid,)) if rid in self._waiting else (rid,))
         )
         super().finish_requests(list(expanded), status)
+        self._publish_all_whole_cohort_progress()
 
     def add_startup_warmup(self, request: OmniDiffusionRequest) -> str:
         """Admit the engine's own dummy request before serving begins."""
@@ -156,6 +404,8 @@ class RequestScheduler(BaseScheduler):
         return super()._add_request_with_request_id(request.request_id, request)
 
     def _add_request_with_request_id(self, request_id: str, request: OmniDiffusionRequest) -> str:
+        if self._reply_only_required:
+            raise ValueError("dedicated reply-only scheduler rejects requests without an owner lease")
         extra = getattr(request.sampling_params, "extra_args", None) or {}
         observation = extra.get("robot_obs")
         try:
@@ -191,6 +441,7 @@ class RequestScheduler(BaseScheduler):
             self._cohorts.mark_uncoordinated()
             if isinstance(observation, dict):
                 observation[COHORT_RECEIPT_FIELD] = missing_cohort_receipt()
+        self._publish_all_whole_cohort_progress()
         return admitted
 
     def _head_cohort(self) -> tuple[CohortMetadata, dict[str, int]] | None:
@@ -276,6 +527,11 @@ class RequestScheduler(BaseScheduler):
                         }
                     )
         self._cohort_pending_close = None
+        scheduled_at_ns = time.monotonic_ns()
+        for request_id in output.scheduled_request_ids:
+            if request_id in self._whole_cohorts:
+                self._whole_request_scheduled_ns[request_id] = scheduled_at_ns
+        self._publish_all_whole_cohort_progress()
         return output
 
     def _can_schedule_waiting(self, state: SchedulerRequestState) -> bool:

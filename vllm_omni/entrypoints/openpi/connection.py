@@ -40,6 +40,8 @@ from starlette.websockets import WebSocketDisconnect
 from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.openpi.serving import (
+    REPLY_ONLY_SCHEMA,
+    WHOLE_COHORT_PROGRESS_SCHEMA,
     WHOLE_COHORT_SCHEMA,
     ServingRealtimeRobotOpenPI,
 )
@@ -215,23 +217,78 @@ class RobotRealtimeConnection:
         return obs
 
     async def _infer_whole_cohort(self, obs: dict) -> bool:
-        if obs.keys() != {"cohort_id", "members"} or not isinstance(obs["members"], list):
+        owner_id = obs.get("owner_id")
+        progress = obs.get("progress", False)
+        allowed = {"cohort_id", "members"}
+        if "owner_id" in obs:
+            allowed.add("owner_id")
+        if "progress" in obs:
+            allowed.add("progress")
+        if (
+            obs.keys() != allowed
+            or not isinstance(obs.get("members"), list)
+            or type(progress) is not bool
+            or ("owner_id" in obs and (not isinstance(owner_id, str) or not owner_id))
+        ):
             raise ValueError("invalid whole-cohort envelope")
         cohort_id, members = obs["cohort_id"], obs["members"]
-        inference = asyncio.create_task(self.serving.infer_whole_cohort(cohort_id, members))
-        incoming = asyncio.create_task(self.websocket.receive())
+        inference = asyncio.create_task(
+            self.serving.infer_whole_cohort(cohort_id, members, owner_id=owner_id, progress=progress)
+        )
+        incoming = None
+        terminal_sent = False
         try:
-            finished, _ = await asyncio.wait((inference, incoming), return_when=asyncio.FIRST_COMPLETED)
-            if incoming in finished:
-                # A cohort socket allows one exchange at a time. Losing it
-                # cancels the open inference without undoing replay protection.
-                if incoming.result()["type"] != "websocket.disconnect":
+            if progress:
+                incoming = asyncio.create_task(self.websocket.receive())
+                while True:
+                    if inference.done():
+                        # In progress mode, the next correlated poll is a receive
+                        # barrier: send the terminal reply in its place. This
+                        # prevents an unsolicited progress frame from remaining
+                        # queued after the inference result.
+                        message = await incoming
+                        self._validate_cohort_progress_poll(message, cohort_id)
+                        break
+                    finished, _ = await asyncio.wait((inference, incoming), return_when=asyncio.FIRST_COMPLETED)
+                    if incoming in finished:
+                        message = incoming.result()
+                        self._validate_cohort_progress_poll(message, cohort_id)
+                        if inference.done():
+                            break
+                        poll = self._unpack_request(message["bytes"])
+                        request_ids = [member.get("request_id") for member in members if isinstance(member, dict)]
+                        if (
+                            len(request_ids) != len(members)
+                            or len(set(request_ids)) != len(request_ids)
+                            or any(not isinstance(request_id, str) or not request_id for request_id in request_ids)
+                        ):
+                            raise ValueError("invalid whole-cohort request IDs")
+                        progress_reply = self.serving.whole_cohort_progress(
+                            cohort_id, poll["poll_sequence"], request_ids
+                        )
+                        await self.websocket.send_bytes(_pack(progress_reply))
+                        incoming = asyncio.create_task(self.websocket.receive())
+                    if inference in finished:
+                        # Do not send terminal yet. Wait for the next poll and
+                        # replace its response with the terminal frame.
+                        continue
+            else:
+                # Keep disconnect cancellation behavior in compact mode without
+                # introducing progress frames or delaying terminal replies.
+                incoming = asyncio.create_task(self.websocket.receive())
+                finished, _ = await asyncio.wait((inference, incoming), return_when=asyncio.FIRST_COMPLETED)
+                if incoming in finished:
+                    message = incoming.result()
+                    if message.get("type") == "websocket.disconnect":
+                        return False
                     await self.websocket.close(code=1008)
-                return False
-            # Retire this exchange's receiver before a peer can send its next
-            # request in response to the terminal reply.
-            incoming.cancel()
-            await asyncio.gather(incoming, return_exceptions=True)
+                    return False
+                await inference
+
+            if incoming is not None:
+                incoming.cancel()
+                await asyncio.gather(incoming, return_exceptions=True)
+                incoming = None
             results = [
                 {"request_id": member["request_id"], "payload": _pack(action)}
                 if action is not None
@@ -242,12 +299,38 @@ class RobotRealtimeConnection:
             if len(reply) > MAX_OPENPI_PAYLOAD_BYTES:
                 raise ValueError("whole-cohort reply exceeds frame limit")
             await self.websocket.send_bytes(reply)
+            terminal_sent = True
+            if owner_id is not None:
+                self.serving.complete_reply_only_cohort(cohort_id, owner_id, terminal_received=True)
             return True
         finally:
-            for task in (incoming, inference):
-                if not task.done():
-                    task.cancel()
-            await asyncio.gather(incoming, inference, return_exceptions=True)
+            if incoming is not None and not incoming.done():
+                incoming.cancel()
+            if incoming is not None:
+                await asyncio.gather(incoming, return_exceptions=True)
+            if not inference.done():
+                inference.cancel()
+            await asyncio.gather(inference, return_exceptions=True)
+            if owner_id is not None and not terminal_sent:
+                self.serving.complete_reply_only_cohort(cohort_id, owner_id, terminal_received=False)
+
+    def _validate_cohort_progress_poll(self, message: dict, cohort_id: str) -> None:
+        if message.get("type") == "websocket.disconnect":
+            raise WebSocketDisconnect()
+        if "bytes" not in message or not message["bytes"]:
+            raise ValueError("empty progress poll")
+        poll = self._unpack_request(message["bytes"])
+        if (
+            poll.keys() != {"type", "schema", "instance_id", "generation", "cohort_id", "poll_sequence"}
+            or poll.get("type") != "progress_poll"
+            or poll.get("schema") != WHOLE_COHORT_PROGRESS_SCHEMA
+            or poll.get("instance_id") != os.environ.get("VLLM_OMNI_STATUS_INSTANCE")
+            or poll.get("generation") != self.serving._process_generation
+            or poll.get("cohort_id") != cohort_id
+            or type(poll.get("poll_sequence")) is not int
+            or not 0 <= poll["poll_sequence"] < 2**63
+        ):
+            raise ValueError("uncorrelated progress poll")
 
     async def handle_connection(self) -> None:
         """Main loop for OpenPI-compatible policy serving."""
@@ -262,6 +345,17 @@ class RobotRealtimeConnection:
                 metadata["gatekeeper_whole_cohort_capacity"] = capacity
                 if status_instance := os.environ.get("VLLM_OMNI_STATUS_INSTANCE"):
                     metadata["gatekeeper_status_instance"] = status_instance
+            if initial := self.serving.progress_handshake():
+                metadata["gatekeeper_progress_schema"] = WHOLE_COHORT_PROGRESS_SCHEMA
+                metadata["gatekeeper_progress_instance"] = initial["instance_id"]
+                metadata["gatekeeper_progress_generation"] = initial["generation"]
+                metadata["gatekeeper_progress_initial"] = initial["initial"]
+            if reply_only := self.serving.reply_only_handshake():
+                metadata["gatekeeper_reply_only_schema"] = REPLY_ONLY_SCHEMA
+                metadata["gatekeeper_reply_only_instance"] = reply_only["instance_id"]
+                metadata["gatekeeper_reply_only_generation"] = reply_only["generation"]
+                metadata["gatekeeper_reply_only_capacity"] = 1
+                metadata["gatekeeper_reply_only_idle"] = True
             if os.environ.get("VLLM_OMNI_COHORT_SCHEMA") == "vllm_omni.cohort.v2":
                 metadata["gatekeeper_cohort_schema"] = "vllm_omni.cohort.v2"
                 metadata["gatekeeper_status_instance"] = os.environ["VLLM_OMNI_STATUS_INSTANCE"]
@@ -302,6 +396,24 @@ class RobotRealtimeConnection:
                     continue
 
                 try:
+                    if obs.get("type") == "progress_poll":
+                        poll = obs
+                        if (
+                            poll.keys() != {"type", "schema", "instance_id", "generation", "cohort_id", "poll_sequence"}
+                            or poll.get("schema") != WHOLE_COHORT_PROGRESS_SCHEMA
+                            or poll.get("instance_id") != os.environ.get("VLLM_OMNI_STATUS_INSTANCE")
+                            or poll.get("generation") != self.serving._process_generation
+                            or poll.get("type") != "progress_poll"
+                            or (poll.get("cohort_id") is not None and not isinstance(poll.get("cohort_id"), str))
+                            or type(poll.get("poll_sequence")) is not int
+                            or not 0 <= poll["poll_sequence"] < 2**63
+                        ):
+                            await self.websocket.close(code=1008)
+                            return
+                        await self.websocket.send_bytes(
+                            _pack(self.serving.whole_cohort_progress(poll["cohort_id"], poll["poll_sequence"]))
+                        )
+                        continue
                     endpoint = obs.pop("endpoint", "infer")
 
                     if endpoint == "reset":
@@ -311,6 +423,9 @@ class RobotRealtimeConnection:
                     elif endpoint == "infer_cohort":
                         if not await self._infer_whole_cohort(obs):
                             return
+                    elif endpoint == "progress_poll":
+                        await self.websocket.close(code=1008)
+                        return
                     else:
                         session_id = str(obs.get("session_id") or self._current_session_id or "default")
                         if session_id != self._current_session_id:
@@ -329,6 +444,8 @@ class RobotRealtimeConnection:
                             reset=reset,
                         )
                         await self.websocket.send_bytes(_pack(actions))
+                except WebSocketDisconnect:
+                    return
                 except Exception:
                     logger.exception("Error handling request")
                     try:
