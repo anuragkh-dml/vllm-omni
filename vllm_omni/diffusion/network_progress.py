@@ -16,7 +16,7 @@ import uuid
 from collections.abc import Callable
 
 ABSOLUTE = "host_monotonic.v1"
-ELAPSED = "elapsed.v2"
+ELAPSED = "elapsed.v3"
 MAX_BODY = 2 * 1024 * 1024
 MAX_HEADER = 4096
 DEADLINE_S = 0.1
@@ -31,29 +31,48 @@ def _mac(key: bytes, purpose: bytes, nonce: bytes, schema: bytes, body: bytes = 
     )
 
 
-def _elapsed_status(status: dict) -> dict:
-    """Publish ages measured at one scheduler capture on the server clock."""
+def _predictive_status(status: dict, *, elapsed: bool) -> dict:
+    """Project the diagnostic snapshot onto facts consumed by Predictive."""
     observed = status["observed_ns"]
 
-    def convert(record: dict) -> dict:
-        result = {}
-        for field, value in record.items():
-            if field in {"at_ns", "start_ns", "first_queue_enter_ns", "last_queue_enter_ns", "close_ns"}:
-                elapsed = observed - value
-                if elapsed < 0:
-                    raise ValueError("status event after capture")
-                field = "age_ns" if field == "at_ns" else field.removesuffix("_ns") + "_age_ns"
-                value = elapsed
-            result[field] = value
-        return result
+    def age(at_ns: int) -> int:
+        duration = observed - at_ns
+        if duration < 0:
+            raise ValueError("status event after capture")
+        return duration
 
+    active = status["active"]
+    if active is not None:
+        start_ns = active["start_ns"]
+        active = {"forward_id": active["forward_id"], "request_ids": active["request_ids"]}
+        if elapsed:
+            active["start_age_ns"] = age(start_ns)
+        else:
+            active["start_ns"] = start_ns
+    completions = [event for event in status["recent_events"] if event["kind"] == "forward_end"]
+    # Allowlist fields so future diagnostic metadata and host-local timestamps
+    # cannot leak into network snapshots. Keep scheduler order for prediction.
+    if elapsed:
+        return {
+            "schema": "omni_scheduler_progress.v3",
+            "clock_domain": "server_elapsed_ns",
+            "active": active,
+            "queued_request_ids": status["queued_request_ids"],
+            "recent_completions": [
+                {"age_ns": age(event["at_ns"]), "request_ids": event["request_ids"]} for event in completions
+            ],
+        }
     return {
-        "schema": "omni_scheduler_progress.v2",
-        "clock_domain": "server_elapsed_ns",
+        "schema": "omni_scheduler_progress.v1",
+        "clock_domain": "host_monotonic_ns",
         "hostname": status["hostname"],
-        "active": convert(status["active"]) if status["active"] is not None else None,
+        "observed_ns": observed,
+        "active": active,
         "queued_request_ids": status["queued_request_ids"],
-        "recent_events": [convert(event) for event in status["recent_events"]],
+        "recent_events": [
+            {"kind": "forward_end", "at_ns": event["at_ns"], "request_ids": event["request_ids"]}
+            for event in completions
+        ],
     }
 
 
@@ -138,8 +157,7 @@ class _StatusServer(socketserver.TCPServer):
                 or len(snapshot.get("recent_events", ())) > 256
             ):
                 return
-            if schema == ELAPSED.encode():
-                snapshot = _elapsed_status(snapshot)
+            snapshot = _predictive_status(snapshot, elapsed=schema == ELAPSED.encode())
             envelope = {
                 "instance_id": self.instance,
                 "boot_id": self.boot,
@@ -157,7 +175,7 @@ class _StatusServer(socketserver.TCPServer):
                 return
             body = bytes(body)
             self._send(request, b"200 OK", body, _mac(self.key, b"response", nonce, schema, body), deadline)
-        except (OSError, ValueError):
+        except (OSError, KeyError, TypeError, ValueError):
             # An interrupted poll cannot block the scheduler or expose partial status.
             return
 
