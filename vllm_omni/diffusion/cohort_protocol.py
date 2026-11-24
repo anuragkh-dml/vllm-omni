@@ -5,14 +5,15 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from hashlib import sha256
 
-import regex as re
-
 COHORT_WIRE_FIELD = "vllm_omni_cohort"
 COHORT_WIRE_SCHEMA = "vllm_omni.cohort.v1"
+COHORT_ELAPSED_SCHEMA = "vllm_omni.cohort.v2"
+MAX_COHORT_WAIT_NS = 1_000_000_000
 COHORT_RECEIPT_FIELD = "vllm_omni_server_cohort"
 COHORT_RECEIPT_SCHEMA = "vllm_omni.cohort_receipt.v1"
 COHORT_WIRE_FIELDS = frozenset(
@@ -76,8 +77,15 @@ class CohortMetadata:
     expected_size: int
     member_ids: tuple[str, ...]
     membership_hash: str
-    deadline_ns: int
+    deadline_ns: int | None
     policy_id: str
+    max_wait_ns: int | None = None
+
+    def server_deadline_ns(self, first_queue_enter_ns: int) -> int:
+        if self.max_wait_ns is not None:
+            return first_queue_enter_ns + self.max_wait_ns
+        assert self.deadline_ns is not None
+        return self.deadline_ns
 
     @property
     def contract(self) -> tuple[object, ...]:
@@ -88,6 +96,7 @@ class CohortMetadata:
             self.membership_hash,
             self.deadline_ns,
             self.policy_id,
+            self.max_wait_ns,
         )
 
 
@@ -97,20 +106,29 @@ def parse_cohort_metadata(
     enabled: bool,
     expected_policy_id: str | None,
     max_batch_size: int,
+    wire_schema: str = COHORT_WIRE_SCHEMA,
 ) -> CohortMetadata | None:
     """Validate one request from the neutral, versioned wire protocol."""
 
-    if not enabled or observation is None:
+    if not enabled:
         return None
-    if COHORT_WIRE_FIELD not in observation:
+    if observation is None or COHORT_WIRE_FIELD not in observation:
+        if wire_schema == COHORT_ELAPSED_SCHEMA:
+            raise CohortProtocolError("incomplete_metadata")
         return None
     wire = observation[COHORT_WIRE_FIELD]
     if not isinstance(wire, Mapping):
         raise CohortProtocolError("invalid_metadata")
-    if not COHORT_WIRE_FIELDS <= wire.keys():
+    if "schema" not in wire:
         raise CohortProtocolError("incomplete_metadata")
-    if wire["schema"] != COHORT_WIRE_SCHEMA:
+    if wire["schema"] != wire_schema or wire_schema not in (COHORT_WIRE_SCHEMA, COHORT_ELAPSED_SCHEMA):
         raise CohortProtocolError("invalid_schema")
+    elapsed = wire_schema == COHORT_ELAPSED_SCHEMA
+    if elapsed:
+        if wire.keys() != (COHORT_WIRE_FIELDS - {"deadline_ns"}) | {"max_wait_ns"}:
+            raise CohortProtocolError("invalid_elapsed_fields")
+    elif not COHORT_WIRE_FIELDS <= wire.keys() or "max_wait_ns" in wire:
+        raise CohortProtocolError("incomplete_metadata")
     expected_policy_id = _identifier(expected_policy_id, "configured_policy_id")
     epoch_id = _identifier(wire["epoch_id"], "epoch_id")
     member_id = _identifier(wire["member_id"], "member_id")
@@ -131,7 +149,10 @@ def parse_cohort_metadata(
         raise CohortProtocolError("member_not_in_cohort")
     if _hash(wire["membership_hash"], "membership_hash") != digest:
         raise CohortProtocolError("membership_hash_mismatch")
-    deadline_ns = _integer(wire["deadline_ns"], "deadline_ns", 1)
+    deadline_ns = None if elapsed else _integer(wire["deadline_ns"], "deadline_ns", 1)
+    max_wait_ns = _integer(wire["max_wait_ns"], "max_wait_ns", 1) if elapsed else None
+    if max_wait_ns is not None and max_wait_ns > MAX_COHORT_WAIT_NS:
+        raise CohortProtocolError("invalid_max_wait_ns")
     policy_id = _identifier(wire["policy_id"], "policy_id")
     if policy_id != expected_policy_id:
         raise CohortProtocolError("policy_id_mismatch")
@@ -144,6 +165,7 @@ def parse_cohort_metadata(
         membership_hash=digest,
         deadline_ns=deadline_ns,
         policy_id=policy_id,
+        max_wait_ns=max_wait_ns,
     )
 
 
@@ -179,13 +201,14 @@ def evaluate_cohort_close(
     now_ns = _integer(now_ns, "now_ns", 0)
     configured_timeout_ns = _integer(configured_timeout_ns, "configured_timeout_ns", 0)
     max_batch_size = _integer(max_batch_size, "max_batch_size", 1)
+    cohort_deadline = metadata.server_deadline_ns(min(times))
     reason = (
         "expected_count"
         if len(arrived) == metadata.expected_size
         else "max_batch"
         if len(arrived) >= max_batch_size
         else "cohort_deadline"
-        if now_ns >= metadata.deadline_ns and metadata.deadline_ns <= configured_timeout_ns
+        if now_ns >= cohort_deadline and cohort_deadline <= configured_timeout_ns
         else "configured_timeout"
         if now_ns >= configured_timeout_ns
         else None

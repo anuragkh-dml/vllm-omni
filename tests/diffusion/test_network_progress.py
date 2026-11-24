@@ -5,7 +5,9 @@ import http.client
 import json
 import secrets
 
-from vllm_omni.diffusion.network_progress import ABSOLUTE, NetworkProgressEndpoint, _mac
+import pytest
+
+from vllm_omni.diffusion.network_progress import ABSOLUTE, ELAPSED, NetworkProgressEndpoint, _mac
 
 
 def _poll(port, key, schema=ABSOLUTE):
@@ -51,3 +53,43 @@ def test_status_authentication_order_and_server_restart():
         assert new_response["boot_id"] != first_response["boot_id"]
     finally:
         restarted.close()
+
+
+def test_elapsed_status_preserves_fields_without_exporting_absolute_times():
+    key = bytes(range(32))
+    full = {
+        "schema": "omni_scheduler_progress.v1",
+        "clock_domain": "host_monotonic_ns",
+        "hostname": "a-different-host",
+        "observed_ns": 10**15,
+        "active": {"start_ns": 10**15 - 3, "forward_id": "f", "request_ids": ["active"]},
+        "queued_request_ids": ["queued"],
+        "recent_events": [
+            {"kind": "cohort_close", "at_ns": 10**15 - 20, "close_ns": 10**15 - 20, "epoch_id": "test"},
+        ],
+    }
+    endpoint = NetworkProgressEndpoint(0, key.hex(), "group", lambda: full)
+    try:
+        assert json.loads(_poll(endpoint.port, key)[1])["status"] == full
+        elapsed = json.loads(_poll(endpoint.port, key, ELAPSED)[1])["status"]
+        assert elapsed == {
+            "schema": "omni_scheduler_progress.v2",
+            "clock_domain": "server_elapsed_ns",
+            "hostname": "a-different-host",
+            "active": {"start_age_ns": 3, "forward_id": "f", "request_ids": ["active"]},
+            "queued_request_ids": ["queued"],
+            "recent_events": [{"kind": "cohort_close", "age_ns": 20, "close_age_ns": 20, "epoch_id": "test"}],
+        }
+    finally:
+        endpoint.close()
+
+
+@pytest.mark.parametrize("queued", [list(range(1025)), ["x" * (2 * 1024 * 1024)]])
+def test_oversized_status_is_dropped_instead_of_looking_idle(queued):
+    key = bytes(range(32))
+    endpoint = NetworkProgressEndpoint(0, key.hex(), "group", lambda: {"active": None, "queued_request_ids": queued})
+    try:
+        with pytest.raises(http.client.RemoteDisconnected):
+            _poll(endpoint.port, key)
+    finally:
+        endpoint.close()

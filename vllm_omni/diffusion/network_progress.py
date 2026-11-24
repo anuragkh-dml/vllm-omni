@@ -16,6 +16,7 @@ import uuid
 from collections.abc import Callable
 
 ABSOLUTE = "host_monotonic.v1"
+ELAPSED = "elapsed.v2"
 MAX_BODY = 2 * 1024 * 1024
 MAX_HEADER = 4096
 DEADLINE_S = 0.1
@@ -28,6 +29,32 @@ def _mac(key: bytes, purpose: bytes, nonce: bytes, schema: bytes, body: bytes = 
         .hex()
         .encode()
     )
+
+
+def _elapsed_status(status: dict) -> dict:
+    """Publish ages measured at one scheduler capture on the server clock."""
+    observed = status["observed_ns"]
+
+    def convert(record: dict) -> dict:
+        result = {}
+        for field, value in record.items():
+            if field in {"at_ns", "start_ns", "first_queue_enter_ns", "last_queue_enter_ns", "close_ns"}:
+                elapsed = observed - value
+                if elapsed < 0:
+                    raise ValueError("status event after capture")
+                field = "age_ns" if field == "at_ns" else field.removesuffix("_ns") + "_age_ns"
+                value = elapsed
+            result[field] = value
+        return result
+
+    return {
+        "schema": "omni_scheduler_progress.v2",
+        "clock_domain": "server_elapsed_ns",
+        "hostname": status["hostname"],
+        "active": convert(status["active"]) if status["active"] is not None else None,
+        "queued_request_ids": status["queued_request_ids"],
+        "recent_events": [convert(event) for event in status["recent_events"]],
+    }
 
 
 class _StatusHandler(socketserver.BaseRequestHandler):
@@ -89,26 +116,46 @@ class _StatusServer(socketserver.TCPServer):
                 if not name or not sep or name in fields:
                     return
                 fields[name] = bytes(value.strip())
+            if fields.get(b"content-length", b"0") != b"0" or b"transfer-encoding" in fields:
+                return
             nonce = fields.get(b"x-status-nonce", b"")
             schema = fields.get(b"x-status-schema", b"")
             auth = fields.get(b"x-status-auth", b"")
             if (
                 not NONCE.fullmatch(nonce)
-                or schema != ABSOLUTE.encode()
+                or schema not in (ABSOLUTE.encode(), ELAPSED.encode())
                 or not hmac.compare_digest(auth, _mac(self.key, b"request", nonce, schema))
             ):
                 self._send(request, b"401 Unauthorized", b"", b"", deadline)
                 return
             self.sequence += 1
+            snapshot = self.snapshot()
+            # An oversized state is unavailable. Dropping unknown queued or
+            # active work would publish a misleading capacity observation.
+            if (
+                len(snapshot.get("queued_request_ids", ())) > 1024
+                or len((snapshot["active"] or {}).get("request_ids", ())) > 1024
+                or len(snapshot.get("recent_events", ())) > 256
+            ):
+                return
+            if schema == ELAPSED.encode():
+                snapshot = _elapsed_status(snapshot)
             envelope = {
                 "instance_id": self.instance,
                 "boot_id": self.boot,
                 "sequence": self.sequence,
-                "status": self.snapshot(),
+                "status": snapshot,
             }
-            body = json.dumps(envelope, separators=(",", ":"), allow_nan=False).encode()
-            if len(body) > MAX_BODY or time.monotonic() >= deadline:
+            body = bytearray()
+            for part in json.JSONEncoder(separators=(",", ":"), allow_nan=False).iterencode(envelope):
+                if len(part) > MAX_BODY - len(body):
+                    return
+                body.extend(part.encode())
+                if len(body) > MAX_BODY:
+                    return
+            if time.monotonic() >= deadline:
                 return
+            body = bytes(body)
             self._send(request, b"200 OK", body, _mac(self.key, b"response", nonce, schema, body), deadline)
         except (OSError, ValueError):
             # An interrupted poll cannot block the scheduler or expose partial status.

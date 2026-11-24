@@ -9,7 +9,9 @@ from dataclasses import asdict, fields
 from typing import TYPE_CHECKING
 
 from vllm_omni.diffusion.cohort_protocol import (
+    COHORT_ELAPSED_SCHEMA,
     COHORT_RECEIPT_FIELD,
+    COHORT_WIRE_SCHEMA,
     CohortClose,
     CohortMetadata,
     CohortProtocolError,
@@ -78,7 +80,13 @@ class RequestScheduler(BaseScheduler):
         policy_id = os.environ.get("VLLM_OMNI_COHORT_POLICY_ID")
         if enabled and (not isinstance(policy_id, str) or not policy_id or len(policy_id) > 256):
             raise ValueError("cohort scheduling requires a nonempty policy ID")
+        schema = os.environ.get("VLLM_OMNI_COHORT_SCHEMA", COHORT_WIRE_SCHEMA)
+        if schema not in (COHORT_WIRE_SCHEMA, COHORT_ELAPSED_SCHEMA) or (
+            schema == COHORT_ELAPSED_SCHEMA and not enabled
+        ):
+            raise ValueError("relative cohort schema requires cohort scheduling")
         super().__init__()
+        self._cohort_schema = schema
         self._cohort_enabled = enabled
         self._cohort_policy_id = policy_id
         self._cohorts = CohortRegistry()
@@ -109,6 +117,7 @@ class RequestScheduler(BaseScheduler):
                 enabled=self._cohort_enabled,
                 expected_policy_id=self._cohort_policy_id,
                 max_batch_size=self.max_num_running_reqs,
+                wire_schema=self._cohort_schema,
             )
             previous_last = self._cohorts.register(metadata) if metadata is not None else None
         except CohortProtocolError as exc:
@@ -262,7 +271,8 @@ class RequestScheduler(BaseScheduler):
         head = self._head_cohort()
         if head is not None:
             self._cohort_configured_timeout_ns = round(configured_deadline * 1e9)
-            deadline = min(configured_deadline, head[0].deadline_ns / 1e9)
+            metadata, arrivals = head
+            deadline = min(configured_deadline, metadata.server_deadline_ns(min(arrivals.values())) / 1e9)
             return _AdmissionWaitDecision(
                 should_wait=True,
                 deadline=deadline,

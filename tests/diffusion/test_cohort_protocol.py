@@ -11,6 +11,7 @@ from hashlib import sha256
 import pytest
 
 from vllm_omni.diffusion.cohort_protocol import (
+    COHORT_ELAPSED_SCHEMA,
     COHORT_RECEIPT_FIELD,
     COHORT_WIRE_FIELD,
     COHORT_WIRE_SCHEMA,
@@ -261,3 +262,32 @@ def test_forward_event_reports_exact_cohort_or_mixed_reason():
     assert cohort_forward_telemetry([{COHORT_RECEIPT_FIELD: missing_cohort_receipt()}]) == {
         "cohort_metadata_validation_reason": "metadata_absent"
     }
+
+
+def test_relative_cohort_deadline_is_anchored_to_first_server_arrival():
+    observation = _observation(2)
+    wire = observation[COHORT_WIRE_FIELD]
+    wire["schema"] = COHORT_ELAPSED_SCHEMA
+    old_deadline = wire.pop("deadline_ns")
+    wire["max_wait_ns"] = 20
+    options = {"enabled": True, "expected_policy_id": POLICY_ID, "max_batch_size": 4}
+    with pytest.raises(CohortProtocolError, match="invalid_schema"):
+        parse_cohort_metadata(observation, **options)
+    parsed = parse_cohort_metadata(observation, **options, wire_schema=COHORT_ELAPSED_SCHEMA)
+    assert parsed.deadline_ns is None
+    start = 10**16
+    assert parsed.server_deadline_ns(start) == start + 20
+    for offset, expected in ((19, None), (20, "cohort_deadline")):
+        close = evaluate_cohort_close(
+            parsed, {"c0": start}, now_ns=start + offset, configured_timeout_ns=start + 50, max_batch_size=4
+        )
+        assert close.reason == expected
+    wire["deadline_ns"] = old_deadline
+    with pytest.raises(CohortProtocolError, match="invalid_elapsed_fields"):
+        parse_cohort_metadata(observation, **options, wire_schema=COHORT_ELAPSED_SCHEMA)
+    wire.pop("deadline_ns")
+    wire["max_wait_ns"] = 1_000_000_001
+    with pytest.raises(CohortProtocolError, match="invalid_max_wait_ns"):
+        parse_cohort_metadata(observation, **options, wire_schema=COHORT_ELAPSED_SCHEMA)
+    with pytest.raises(CohortProtocolError, match="incomplete_metadata"):
+        parse_cohort_metadata(None, **options, wire_schema=COHORT_ELAPSED_SCHEMA)

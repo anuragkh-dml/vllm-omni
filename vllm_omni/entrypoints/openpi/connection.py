@@ -29,6 +29,7 @@ mappings.
 from __future__ import annotations
 
 import asyncio
+import os
 from collections import OrderedDict
 from typing import Any
 
@@ -220,6 +221,9 @@ class RobotRealtimeConnection:
             # Send model-specific PolicyServerConfig resolved by serving from
             # diffusion od_config.model_config.
             metadata = self.serving.policy_server_config.to_dict()
+            if os.environ.get("VLLM_OMNI_COHORT_SCHEMA") == "vllm_omni.cohort.v2":
+                metadata["gatekeeper_cohort_schema"] = "vllm_omni.cohort.v2"
+                metadata["gatekeeper_status_instance"] = os.environ["VLLM_OMNI_STATUS_INSTANCE"]
             await self.websocket.send_bytes(_pack(metadata))
 
             while True:
