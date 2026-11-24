@@ -108,6 +108,16 @@ class RequestScheduler(BaseScheduler):
         self._request_cohort.pop(request_id, None)
         self._cohort_queue_enter_ns.pop(request_id, None)
 
+    def add_startup_warmup(self, request: OmniDiffusionRequest) -> str:
+        """Admit the engine's own dummy request before serving begins."""
+        if self._cohort_schema != COHORT_ELAPSED_SCHEMA:
+            return self.add_request(request)
+        if not request.is_dummy_run() or self.has_requests():
+            raise ValueError("startup warmup requires a dummy request and an idle scheduler")
+        # Only the engine's startup path calls this. Serving requests still
+        # require v2 metadata even if their ID resembles the dummy request.
+        return super()._add_request_with_request_id(request.request_id, request)
+
     def _add_request_with_request_id(self, request_id: str, request: OmniDiffusionRequest) -> str:
         extra = getattr(request.sampling_params, "extra_args", None) or {}
         observation = extra.get("robot_obs")

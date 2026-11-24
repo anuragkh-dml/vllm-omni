@@ -57,7 +57,8 @@ def test_dummy_run_uses_enough_steps_for_execution_mode(
         lambda model_class_name, supports_audio_input: 1,
     )
 
-    def run_request(request):
+    def run_request(request, *, startup_warmup):
+        assert startup_warmup
         captured_requests.append(request)
         return type("Output", (), {"error": None})()
 

@@ -1589,12 +1589,17 @@ class DiffusionEngine:
             raise RuntimeError("Diffusion execution completed without an output.")
         return final_output
 
-    def add_req_and_wait_for_response(self, request: OmniDiffusionRequest) -> DiffusionOutput:
+    def add_req_and_wait_for_response(
+        self, request: OmniDiffusionRequest, *, startup_warmup: bool = False
+    ) -> DiffusionOutput:
         request = self._prepare_request_for_admission(request)
         with self._rpc_lock:
             if self._closed:
                 raise RuntimeError("DiffusionEngine is closed.")
-            target_request_id = self.scheduler.add_request(request)
+            if startup_warmup and isinstance(self.scheduler, RequestScheduler):
+                target_request_id = self.scheduler.add_startup_warmup(request)
+            else:
+                target_request_id = self.scheduler.add_request(request)
 
             # keep scheduling and executing until the target request is finished
             while True:
@@ -1613,8 +1618,7 @@ class DiffusionEngine:
                         raise RuntimeError("Diffusion scheduler has no runnable requests.")
                     continue
 
-                # NOTE: add_req_and_wait_for_response() is synchronous, will be only called
-                # within _dummy_run, only one request will be scheduled
+                # Startup uses the synchronous path for one request.
                 request_id = target_request_id
                 try:
                     self._prepare_kv_for_forward(sched_output)
@@ -1834,7 +1838,7 @@ class DiffusionEngine:
             logger.info("Skipping dummy warmup run (num_frames=0)")
             return
         logger.info("dummy run to warm up the model")
-        output = self.add_req_and_wait_for_response(req)
+        output = self.add_req_and_wait_for_response(req, startup_warmup=True)
         if output.error:
             raise RuntimeError(f"Dummy run failed: {output.error}")
 

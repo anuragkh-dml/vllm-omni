@@ -767,7 +767,8 @@ def test_diffusers_adapter_sana_i2v_warmup_supplies_image():
     captured_requests = []
     engine.pre_process_func = lambda request: request
 
-    def capture_request(request):
+    def capture_request(request, *, startup_warmup):
+        assert startup_warmup
         captured_requests.append(request)
         return SimpleNamespace(error=None)
 

@@ -18,16 +18,18 @@ from vllm.v1.outputs import KVConnectorOutput
 
 from tests.helpers.kv_layout import build_kv_cache_tensor
 from vllm_omni.diffusion.cohort_protocol import (
+    COHORT_ELAPSED_SCHEMA,
     COHORT_RECEIPT_FIELD,
     COHORT_WIRE_FIELD,
     COHORT_WIRE_SCHEMA,
+    CohortProtocolError,
     membership_hash,
 )
 from vllm_omni.diffusion.data import DiffusionOutput, DiffusionRequestAbortedError, OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine, DiffusionExecutionMode
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.diffusion_kv.request import DiffusionKVRequest
-from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID, OmniDiffusionRequest
 from vllm_omni.diffusion.sched import (
     BaseScheduler,
     DiffusionRequestStatus,
@@ -1833,6 +1835,7 @@ class TestDiffusionEngine:
         engine.pre_process_func.assert_not_called()
         admitted_request = engine.add_req_and_wait_for_response.call_args.args[0]
         assert admitted_request.request_id == "dummy_req_id"
+        assert engine.add_req_and_wait_for_response.call_args.kwargs == {"startup_warmup": True}
 
 
 class TestStepScheduler:
@@ -2402,6 +2405,24 @@ def test_neutral_cohort_wire_schedules_exact_membership(monkeypatch):
     assert {receipt["epoch_id"] for receipt in receipts} == {"route/epoch/7"}
     assert {receipt["executed_count"] for receipt in receipts} == {2}
     assert {receipt["close_reason"] for receipt in receipts} == {"expected_count"}
+
+
+def test_elapsed_cohort_warmup_uses_internal_admission(monkeypatch):
+    monkeypatch.setenv("VLLM_OMNI_COHORT_SCHEDULING", "1")
+    monkeypatch.setenv("VLLM_OMNI_COHORT_POLICY_ID", "policy-v1")
+    monkeypatch.setenv("VLLM_OMNI_COHORT_SCHEMA", COHORT_ELAPSED_SCHEMA)
+    scheduler = RequestScheduler()
+    scheduler.initialize(OmniDiffusionConfig(max_num_seqs=2, request_batch_max_wait_ms=25.0))
+
+    dummy = _make_request(DUMMY_DIFFUSION_REQUEST_ID)
+    with pytest.raises(CohortProtocolError, match="incomplete_metadata"):
+        scheduler.add_request(dummy)
+    with pytest.raises(ValueError, match="requires a dummy request"):
+        scheduler.add_startup_warmup(_make_request("external"))
+    assert scheduler.add_startup_warmup(dummy) == dummy.request_id
+    assert _new_ids(scheduler.schedule()) == [dummy.request_id]
+    with pytest.raises(CohortProtocolError, match="incomplete_metadata"):
+        scheduler.add_request(_make_request("external"))
 
 
 def test_benchmark_progress_resolves_request_ids_without_detailed_trace(monkeypatch):
