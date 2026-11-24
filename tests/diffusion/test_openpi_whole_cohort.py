@@ -201,7 +201,11 @@ def test_progress_snapshot_preserves_fifo_and_hides_external_ids(monkeypatch):
     assert before_forward["queued_ids"][:4] == ["robot-a", "robot-b", "robot-c", "robot-d"]
     scheduler.benchmark_forward_start(output)
     running = scheduler.whole_cohort_progress("cohort-a", "robot-group")
+    queued_other = scheduler.whole_cohort_progress("cohort-b", "robot-group")
     assert running["state"] == "running"
+    assert queued_other["state"] == "queued"
+    assert queued_other["active_ids"] == ["robot-a", "robot-b"]
+    assert queued_other["queued_ids"][:2] == ["robot-c", "robot-d"]
     assert running["active_ids"] == ["robot-a", "robot-b"]
     assert running["active_forward_id"] is not None
     assert running["active_start_age_ns"] is not None

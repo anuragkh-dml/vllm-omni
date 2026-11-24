@@ -282,14 +282,16 @@ class RequestScheduler(BaseScheduler):
         ]
         if cohort_id is None:
             state = "running" if forward else "scheduled" if scheduled_internal else "queued" if waiting else "idle"
-        elif forward and scoped_members.intersection(forward_ids):
-            state = "running"
-        elif scoped_members.intersection(scheduled_internal):
-            state = "scheduled"
-        elif scoped_members.intersection(waiting):
-            state = "queued"
         else:
-            state = "finished"
+            target_members = set(self._whole_cohort_members.get(cohort_id, ()))
+            if forward and target_members.intersection(forward_ids):
+                state = "running"
+            elif target_members.intersection(scheduled_internal):
+                state = "scheduled"
+            elif target_members.intersection(waiting):
+                state = "queued"
+            else:
+                state = "finished"
 
         active_start_age_ns = max(0, now_ns - int(forward["start_ns"])) if forward else None
         active_groups = {self._whole_cohorts[rid] for rid in active_internal if rid in self._whole_cohorts}
