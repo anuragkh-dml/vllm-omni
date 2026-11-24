@@ -94,6 +94,7 @@ class RequestScheduler(BaseScheduler):
         self._cohort_queue_enter_ns: dict[str, int] = {}
         self._cohort_configured_timeout_ns: int | None = None
         self._cohort_pending_close: CohortClose | None = None
+        self._whole_cohorts: dict[str, tuple[str, ...]] = {}
 
     def _reset_scheduler_state(self) -> None:
         super()._reset_scheduler_state()
@@ -102,11 +103,47 @@ class RequestScheduler(BaseScheduler):
         self._cohort_queue_enter_ns.clear()
         self._cohort_configured_timeout_ns = None
         self._cohort_pending_close = None
+        self._whole_cohorts.clear()
 
     def _pop_extra_request_state(self, request_id: str) -> None:
         super()._pop_extra_request_state(request_id)
         self._request_cohort.pop(request_id, None)
         self._cohort_queue_enter_ns.pop(request_id, None)
+        self._whole_cohorts.pop(request_id, None)
+
+    def add_whole_cohort(self, requests: list[OmniDiffusionRequest]) -> tuple[str, ...]:
+        """Validate every member before making the ready group visible to scheduling."""
+        ids = tuple(request.request_id for request in requests)
+        if (
+            not 1 <= len(ids) <= self.max_num_running_reqs
+            or len(set(ids)) != len(ids)
+            or any(rid in self._request_states or rid in self._kv_draining_requests for rid in ids)
+            or self._diffusion_kv_manager is not None
+        ):
+            raise ValueError("invalid whole-cohort size, identity or scheduler mode")
+        states = [self._make_request_state(rid, req) for rid, req in zip(ids, requests, strict=True)]
+        if any(state.sampling_params_key != states[0].sampling_params_key for state in states[1:]):
+            raise ValueError("whole cohort has incompatible sampling parameters")
+        queued_at = time.perf_counter()
+        for state in states:
+            rid = state.request_id
+            state.queued_at = queued_at
+            self._request_states[rid] = state
+            self._whole_cohorts[rid] = ids
+        self._waiting.extend(ids)
+        self._publish_benchmark_progress()
+        return ids
+
+    def finish_requests(self, request_ids: str | list[str], status: DiffusionRequestStatus) -> None:
+        ids = [request_ids] if isinstance(request_ids, str) else request_ids
+        # A cancelled queued member invalidates the entire ready unit. Once a
+        # forward starts, normal per-request terminal handling owns its outputs.
+        expanded = dict.fromkeys(
+            member
+            for rid in ids
+            for member in (self._whole_cohorts.get(rid, (rid,)) if rid in self._waiting else (rid,))
+        )
+        super().finish_requests(list(expanded), status)
 
     def add_startup_warmup(self, request: OmniDiffusionRequest) -> str:
         """Admit the engine's own dummy request before serving begins."""
@@ -244,6 +281,9 @@ class RequestScheduler(BaseScheduler):
     def _can_schedule_waiting(self, state: SchedulerRequestState) -> bool:
         if not super()._can_schedule_waiting(state):
             return False
+        cohort = self._whole_cohorts.get(state.request_id)
+        if self._running and cohort != self._whole_cohorts.get(self._running[0]):
+            return False
         if self._cohort_enabled and self._running:
             first = self._request_cohort.get(self._running[0])
             candidate = self._request_cohort.get(state.request_id)
@@ -270,7 +310,11 @@ class RequestScheduler(BaseScheduler):
         self._cohort_pending_close = None
         self._cohort_configured_timeout_ns = None
         max_wait_ms = self.od_config.request_batch_max_wait_ms
-        if max_wait_ms <= 0.0 or self.max_num_running_reqs <= 1:
+        if (
+            max_wait_ms <= 0.0
+            or self.max_num_running_reqs <= 1
+            or (self._waiting and self._waiting[0] in self._whole_cohorts)
+        ):
             return _AdmissionWaitDecision(should_wait=False)
         if self.num_running_requests() > 0:
             return _AdmissionWaitDecision(should_wait=False)
@@ -303,6 +347,8 @@ class RequestScheduler(BaseScheduler):
         now: float,
         stable_since: float,
     ) -> bool:
+        if self._waiting and self._waiting[0] in self._whole_cohorts:
+            return True
         head = self._head_cohort()
         if head is not None:
             now_ns = round(now * 1e9)

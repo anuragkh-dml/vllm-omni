@@ -329,6 +329,7 @@ class OmniEngineBase:
         )
         self.orchestrator_thread.start()
         self._wait_for_orchestrator_init(startup_future, startup_timeout)
+        self.orchestrator_loop = startup_future.result()
         self._correlated_rpc_client = CorrelatedRpcClient(
             self.request_queue.sync_q,
             self.rpc_output_queue.sync_q,

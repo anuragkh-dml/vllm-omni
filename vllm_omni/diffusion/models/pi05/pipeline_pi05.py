@@ -356,6 +356,14 @@ class Pi05Pipeline(nn.Module):
             rtc_requests.append(rtc_request)
             num_steps = int(steps) if steps is not None else None
 
+        whole_cohort_id = (req.requests[0].sampling_params.extra_args or {}).get("whole_cohort_id")
+        if whole_cohort_id is not None and len(valid_indices) != req.num_reqs:
+            # A member can fail model-owned preprocessing after scheduling.
+            # Preserve whole-cohort semantics by skipping the GPU call.
+            for index in valid_indices:
+                outputs[index] = DiffusionOutput(error="whole-cohort member preprocessing failed")
+            valid_indices.clear()
+
         if valid_indices:
             images = [
                 torch.cat([item[0][camera] for item in inputs], dim=0) for camera in range(self.config.max_cameras)
@@ -472,6 +480,8 @@ class Pi05Pipeline(nn.Module):
                             "error_type": type(model_error).__name__ if model_error is not None else None,
                         }
                         event.update(cohort_forward_telemetry(observations))
+                        if whole_cohort_id is not None:
+                            event["whole_cohort_id"] = whole_cohort_id
                         # Worker INFO logs may be filtered by the multiprocess
                         # executor. Write the opt-in benchmark event to the
                         # inherited stderr so the server log retains it.

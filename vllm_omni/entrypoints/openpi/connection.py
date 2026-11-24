@@ -40,6 +40,7 @@ from starlette.websockets import WebSocketDisconnect
 from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.openpi.serving import (
+    WHOLE_COHORT_SCHEMA,
     ServingRealtimeRobotOpenPI,
 )
 
@@ -213,6 +214,41 @@ class RobotRealtimeConnection:
             raise ValueError("Invalid request payload")
         return obs
 
+    async def _infer_whole_cohort(self, obs: dict) -> bool:
+        if obs.keys() != {"cohort_id", "members"} or not isinstance(obs["members"], list):
+            raise ValueError("invalid whole-cohort envelope")
+        cohort_id, members = obs["cohort_id"], obs["members"]
+        inference = asyncio.create_task(self.serving.infer_whole_cohort(cohort_id, members))
+        incoming = asyncio.create_task(self.websocket.receive())
+        try:
+            finished, _ = await asyncio.wait((inference, incoming), return_when=asyncio.FIRST_COMPLETED)
+            if incoming in finished:
+                # A cohort socket allows one exchange at a time. Losing it
+                # cancels the open inference without undoing replay protection.
+                if incoming.result()["type"] != "websocket.disconnect":
+                    await self.websocket.close(code=1008)
+                return False
+            # Retire this exchange's receiver before a peer can send its next
+            # request in response to the terminal reply.
+            incoming.cancel()
+            await asyncio.gather(incoming, return_exceptions=True)
+            results = [
+                {"request_id": member["request_id"], "payload": _pack(action)}
+                if action is not None
+                else {"request_id": member["request_id"], "error": "inference failed"}
+                for member, action in zip(members, inference.result(), strict=True)
+            ]
+            reply = _pack({"cohort_id": cohort_id, "results": results})
+            if len(reply) > MAX_OPENPI_PAYLOAD_BYTES:
+                raise ValueError("whole-cohort reply exceeds frame limit")
+            await self.websocket.send_bytes(reply)
+            return True
+        finally:
+            for task in (incoming, inference):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(incoming, inference, return_exceptions=True)
+
     async def handle_connection(self) -> None:
         """Main loop for OpenPI-compatible policy serving."""
         await self.websocket.accept()
@@ -221,6 +257,11 @@ class RobotRealtimeConnection:
             # Send model-specific PolicyServerConfig resolved by serving from
             # diffusion od_config.model_config.
             metadata = self.serving.policy_server_config.to_dict()
+            if capacity := getattr(self.serving, "whole_cohort_capacity", 0):
+                metadata["gatekeeper_whole_cohort_schema"] = WHOLE_COHORT_SCHEMA
+                metadata["gatekeeper_whole_cohort_capacity"] = capacity
+                if status_instance := os.environ.get("VLLM_OMNI_STATUS_INSTANCE"):
+                    metadata["gatekeeper_status_instance"] = status_instance
             if os.environ.get("VLLM_OMNI_COHORT_SCHEMA") == "vllm_omni.cohort.v2":
                 metadata["gatekeeper_cohort_schema"] = "vllm_omni.cohort.v2"
                 metadata["gatekeeper_status_instance"] = os.environ["VLLM_OMNI_STATUS_INSTANCE"]
@@ -267,6 +308,9 @@ class RobotRealtimeConnection:
                         self.reset()
                         self.serving.reset(obs)
                         await self.websocket.send_bytes(_pack({"status": "reset successful"}))
+                    elif endpoint == "infer_cohort":
+                        if not await self._infer_whole_cohort(obs):
+                            return
                     else:
                         session_id = str(obs.get("session_id") or self._current_session_id or "default")
                         if session_id != self._current_session_id:

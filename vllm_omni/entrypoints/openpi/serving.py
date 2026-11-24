@@ -9,6 +9,8 @@ The loaded policy model owns dataset transforms inside its pipeline.
 
 from __future__ import annotations
 
+import asyncio
+import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 from itertools import count
@@ -26,6 +28,8 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 ActionOutput: TypeAlias = np.ndarray | dict[str, object]
+WHOLE_COHORT_SCHEMA = "vllm_omni.infer_cohort.v1"
+MAX_COHORT_SESSIONS = 1024
 
 
 def _to_builtin_container(value: Any) -> Any:
@@ -93,6 +97,72 @@ class ServingRealtimeRobotOpenPI:
         self.policy_server_config = PolicyServerConfig.from_model_config(policy_model_config)
         self.prompt_builder = self._load_prompt_builder(engine_client, policy_model_config, self.policy_server_config)
         self._request_counter = count()
+        self._cohort_session_sequences: dict[str, int] = {}
+
+    def _whole_cohort_replica(self):
+        # Use the existing inline stage and its owning event loop. Other
+        # topologies require a grouped submission through their routing layer.
+        engine = getattr(self.engine_client, "engine", None)
+        pools = getattr(engine, "stage_pools", ())
+        if os.environ.get("VLLM_OMNI_OPENPI_WHOLE_COHORT") != "1" or len(pools) != 1:
+            return None
+        pool = pools[0]
+        if pool.stage_type != "diffusion" or len(pool.live_replica_ids()) != 1:
+            return None
+        client = pool.stage_client
+        return client if getattr(client, "whole_cohort_capacity", 0) else None
+
+    @property
+    def whole_cohort_capacity(self) -> int:
+        replica = self._whole_cohort_replica()
+        return min(replica.whole_cohort_capacity, 1024) if replica is not None else 0
+
+    async def infer_whole_cohort(self, cohort_id: str, members: list[dict]) -> list[ActionOutput | None]:
+        replica = self._whole_cohort_replica()
+        if replica is None or not 1 <= len(members) <= self.whole_cohort_capacity:
+            raise ValueError("whole-cohort inference is unavailable or beyond replica capacity")
+        if not isinstance(cohort_id, str) or not 1 <= len(cohort_id) <= 256:
+            raise ValueError("invalid whole-cohort identity")
+        requests = []
+        advances = {}
+        ids = set()
+        for member in members:
+            if not isinstance(member, dict) or {"endpoint", "vllm_omni_cohort"} & member.keys():
+                raise ValueError("invalid whole-cohort member")
+            rid, session, sequence = (member.get(key) for key in ("request_id", "session_id", "session_sequence"))
+            if (
+                not all(isinstance(value, str) and 1 <= len(value) <= 256 for value in (rid, session))
+                or rid in ids
+                or session in advances
+                or type(sequence) is not int
+                or not 0 <= sequence < 2**63
+                or sequence <= self._cohort_session_sequences.get(session, -1)
+            ):
+                raise ValueError("invalid or replayed whole-cohort member identity")
+            observation = {k: v for k, v in member.items() if k != "session_sequence"}
+            request = self.build_request(
+                observation, session_id=session, reset=session not in self._cohort_session_sequences
+            )
+            request.sampling_params.extra_args["whole_cohort_id"] = cohort_id
+            requests.append(request)
+            advances[session] = sequence
+            ids.add(rid)
+        if len(self._cohort_session_sequences.keys() | advances.keys()) > MAX_COHORT_SESSIONS:
+            raise ValueError("whole-cohort session registry is full")
+        # Retain per-session high-water marks across sockets, including after
+        # cancellation. Eviction would silently allow a replay.
+        self._cohort_session_sequences.update(advances)
+        engine = self.engine_client.engine
+        results = await asyncio.wrap_future(
+            asyncio.run_coroutine_threadsafe(replica.infer_whole_cohort(requests), engine.orchestrator_loop)
+        )
+        actions = []
+        for result in results:
+            try:
+                actions.append(None if isinstance(result, BaseException) else self._extract_actions(result))
+            except RuntimeError:
+                actions.append(None)
+        return actions
 
     @classmethod
     def create_policy_server(

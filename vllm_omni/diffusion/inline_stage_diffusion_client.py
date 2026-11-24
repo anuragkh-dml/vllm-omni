@@ -25,6 +25,7 @@ from vllm_omni.diffusion.data import (
     is_diffusion_request_started_output,
 )
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
+from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.engine.stage_client import StageClientBase
 from vllm_omni.engine.stage_init_utils import StageMetadata
@@ -104,6 +105,24 @@ class InlineStageDiffusionClient(StageClientBase):
     # ------------------------------------------------------------------
     # Request processing
     # ------------------------------------------------------------------
+
+    @property
+    def whole_cohort_capacity(self) -> int:
+        config = self.od_config
+        return (
+            config.max_num_seqs
+            if config.model_class_name == "Pi05Pipeline"
+            and not config.step_execution
+            and not config.streaming_output
+            and config.parallel_config.data_parallel_size == 1
+            and config.diffusion_kv_mode == DiffusionKVCacheMode.DENSE_LEGACY
+            else 0
+        )
+
+    async def infer_whole_cohort(self, requests: list[OmniDiffusionRequest]) -> list[OmniRequestOutput | BaseException]:
+        if not 1 <= len(requests) <= self.whole_cohort_capacity or self._shutting_down or self._engine_dead:
+            raise ValueError("whole-cohort replica unavailable or incompatible")
+        return await self._engine.infer_whole_cohort(requests)
 
     async def add_request_async(
         self,

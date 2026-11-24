@@ -13,6 +13,7 @@ import queue
 import threading
 import time
 from collections.abc import AsyncGenerator, Callable, Iterable
+from contextlib import aclosing
 from dataclasses import dataclass, field
 from enum import Enum
 from types import AsyncGeneratorType
@@ -1483,6 +1484,58 @@ class DiffusionEngine:
     def add_request(self, request: OmniDiffusionRequest) -> str:
         request = self._prepare_request_for_admission(request)
         return self._add_prepared_request(request)
+
+    async def infer_whole_cohort(self, requests: list[OmniDiffusionRequest]) -> list[OmniRequestOutput | BaseException]:
+        """Admit one complete nonstreaming request wave on the engine's owner loop."""
+        scheduler = self.scheduler
+        if (
+            self.execution_mode != DiffusionExecutionMode.REQUEST_BATCH
+            or self.od_config.streaming_output
+            or not isinstance(scheduler, RequestScheduler)
+        ):
+            raise ValueError("whole cohorts require nonstreaming request-mode diffusion")
+        prepared = [self._prepare_request_for_admission(request) for request in requests]
+        await self._check_and_start_background_loop()
+        registered = []
+        with self._cv:
+            if self._closed or any(req.request_id in self._out_streams for req in prepared):
+                raise RuntimeError("whole cohort cannot use a closed engine or active request identity")
+            try:
+                if self._request_cancellations is not None:
+                    for request in prepared:
+                        request.cancellation_signal = self._request_cancellations.create(request.request_id)
+                        registered.append(request.request_id)
+                ids = scheduler.add_whole_cohort(prepared)
+            except BaseException:
+                if self._request_cancellations is not None:
+                    for rid in registered:
+                        self._request_cancellations.finish(rid)
+                raise
+            for rid in ids:
+                self._out_streams[rid] = asyncio.Queue()
+            self._cv.notify_all()
+
+        async def collect(request: OmniDiffusionRequest) -> OmniRequestOutput:
+            async with aclosing(self.get_output_stream(request.request_id)) as stream:
+                async for output in stream:
+                    if output.finished:
+                        (result,) = self.postprocess_output(request, output)
+                        return result
+            raise RuntimeError("whole-cohort member produced no terminal result")
+
+        try:
+            return list(await asyncio.gather(*(collect(req) for req in prepared), return_exceptions=True))
+        finally:
+            # Also covers cancellation before an individual consumer ran.
+            with self._cv:
+                pending = [rid for rid in ids if rid in self._out_streams]
+            if pending:
+                self.abort(pending)
+                for rid in pending:
+                    with self._cv:
+                        queue = self._out_streams.get(rid)
+                    if queue is not None:
+                        self._release_output_stream(rid, queue)
 
     def get_output_stream(self, request_id: str) -> AsyncGenerator[DiffusionOutput, None]:
         """Bind a closable stream to the currently registered request queue."""
