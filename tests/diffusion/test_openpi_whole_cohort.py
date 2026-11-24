@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID, OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import DiffusionRequestStatus
 from vllm_omni.diffusion.sched.request_scheduler import RequestScheduler
 from vllm_omni.entrypoints.openpi.connection import RobotRealtimeConnection, _pack, _unpack
@@ -104,7 +104,7 @@ async def test_whole_cohort_wire_correlates_each_reply_and_retires_receiver():
         finally:
             retired.set()
 
-    async def infer(cohort_id, members, *, owner_id=None, progress=False):
+    async def infer(cohort_id, members, *, owner_id=None, progress_scope=None):
         await receiving.wait()
         return [{"actions": [1.0]}, None]
 
@@ -112,6 +112,8 @@ async def test_whole_cohort_wire_correlates_each_reply_and_retires_receiver():
         assert retired.is_set()
 
     connection = object.__new__(RobotRealtimeConnection)
+    connection._progress_scope = None
+    connection._last_progress_poll_sequence = -1
     connection.serving = SimpleNamespace(infer_whole_cohort=infer)
     connection.websocket = SimpleNamespace(receive=receive, send_bytes=AsyncMock(side_effect=send))
     assert await connection._infer_whole_cohort({"cohort_id": "c", "members": _members()})
@@ -131,7 +133,7 @@ async def test_disconnect_cancels_inference_and_preserves_replay_protection(monk
     started = asyncio.Event()
     cancelled = asyncio.Event()
 
-    async def infer(requests, *, cohort_id=None, reply_only_owner=None):
+    async def infer(requests, *, cohort_id=None, reply_only_owner=None, progress_scope=None):
         started.set()
         try:
             await asyncio.Future()
@@ -144,6 +146,8 @@ async def test_disconnect_cancels_inference_and_preserves_replay_protection(monk
 
     serving = await _serving(monkeypatch, infer)
     connection = object.__new__(RobotRealtimeConnection)
+    connection._progress_scope = None
+    connection._last_progress_poll_sequence = -1
     connection.serving = serving
     connection.websocket = SimpleNamespace(receive=disconnect, send_bytes=AsyncMock())
     assert not await connection._infer_whole_cohort({"cohort_id": "c", "members": _members()})
@@ -156,35 +160,81 @@ async def test_disconnect_cancels_inference_and_preserves_replay_protection(monk
 def test_progress_snapshot_preserves_fifo_and_hides_external_ids(monkeypatch):
     monkeypatch.setenv("VLLM_OMNI_OPENPI_PROGRESS", "1")
     scheduler = _scheduler(monkeypatch)
+    initial = scheduler.whole_cohort_progress_snapshot()
+    assert initial["sequence"] > 0
+    assert initial["admission_pending_ids"] == []
+    assert initial["progress_scope"] is None
     own = [_request("internal-a"), _request("internal-b")]
     own[0].sampling_params.extra_args["robot_obs"] = {"request_id": "robot-a"}
     own[1].sampling_params.extra_args["robot_obs"] = {"request_id": "robot-b"}
-    scheduler.add_whole_cohort(own, cohort_id="cohort-a")
+    scheduler.add_whole_cohort(own, cohort_id="cohort-a", progress_scope="robot-group")
+    overlap = [_request("internal-c"), _request("internal-d")]
+    overlap[0].sampling_params.extra_args["robot_obs"] = {"request_id": "robot-c"}
+    overlap[1].sampling_params.extra_args["robot_obs"] = {"request_id": "robot-d"}
+    scheduler.add_whole_cohort(overlap, cohort_id="cohort-b", progress_scope="robot-group")
+    other_scope = _request("internal-other-scope")
+    other_scope.sampling_params.extra_args["robot_obs"] = {"request_id": "robot-other"}
+    scheduler.add_whole_cohort([other_scope], cohort_id="cohort-c", progress_scope="other-group")
     scheduler.add_request(_request("secret-external-request"))
 
-    snapshot = scheduler.whole_cohort_progress("cohort-a")
+    unscoped = scheduler.whole_cohort_progress_snapshot()
+    assert all(not rid.startswith("robot-") for rid in unscoped["queued_ids"])
+    snapshot = scheduler.whole_cohort_progress("cohort-a", "robot-group")
     assert snapshot["state"] == "queued"
-    assert snapshot["queued_ids"][:2] == ["robot-a", "robot-b"]
-    assert snapshot["queued_ids"][2].startswith("external:")
+    assert snapshot["queued_ids"][:4] == ["robot-a", "robot-b", "robot-c", "robot-d"]
+    assert snapshot["queued_ids"][4].startswith("external:")
+    assert snapshot["queued_ids"][5].startswith("external:")
     assert "secret-external-request" not in repr(snapshot)
-    assert snapshot["external_queued_ids"] == [snapshot["queued_ids"][2]]
-    assert snapshot["external_queued_count"] == 1
-    assert snapshot["queued_cohort_count"] == 1
-    assert scheduler.whole_cohort_progress("cohort-a")["sequence"] == snapshot["sequence"]
+    assert "robot-other" not in repr(snapshot)
+    assert snapshot["external_queued_ids"] == snapshot["queued_ids"][4:]
+    assert snapshot["external_queued_count"] == 2
+    assert snapshot["queued_cohort_count"] == 3
+    assert scheduler.whole_cohort_progress("cohort-a", "robot-group")["sequence"] == snapshot["sequence"]
+    with pytest.raises(ValueError, match="does not own"):
+        scheduler.whole_cohort_progress("cohort-a", "other-group")
 
     output = scheduler.schedule()
+    before_forward = scheduler.whole_cohort_progress("cohort-a", "robot-group")
+    assert before_forward["active_ids"] == []
+    assert before_forward["active_forward_id"] is None
+    assert before_forward["active_start_age_ns"] is None
+    assert before_forward["queued_ids"][:4] == ["robot-a", "robot-b", "robot-c", "robot-d"]
     scheduler.benchmark_forward_start(output)
-    running = scheduler.whole_cohort_progress("cohort-a")
+    running = scheduler.whole_cohort_progress("cohort-a", "robot-group")
     assert running["state"] == "running"
     assert running["active_ids"] == ["robot-a", "robot-b"]
     assert running["active_forward_id"] is not None
     assert running["active_start_age_ns"] is not None
-    assert running["external_queued_count"] == 1
-    assert running["queued_ids"][0] == snapshot["queued_ids"][2]
+    assert running["external_queued_count"] == 2
+    assert running["queued_ids"][0:2] == ["robot-c", "robot-d"]
     assert running["sequence"] > snapshot["sequence"]
     scheduler.benchmark_forward_end()
-    completed = scheduler.whole_cohort_progress("cohort-a")["recent_completions"]
+    after_forward = scheduler.whole_cohort_progress("cohort-a", "robot-group")
+    assert after_forward["active_ids"] == []
+    assert after_forward["active_forward_id"] is None
+    assert after_forward["queued_ids"][:4] == ["robot-a", "robot-b", "robot-c", "robot-d"]
+    completed = after_forward["recent_completions"]
     assert completed[-1]["request_ids"] == ["robot-a", "robot-b"]
+
+
+def test_progress_handshake_has_fresh_startup_snapshot_before_any_cohort(monkeypatch):
+    monkeypatch.setenv("VLLM_OMNI_OPENPI_PROGRESS", "1")
+    monkeypatch.setenv("VLLM_OMNI_STATUS_INSTANCE", "policy-instance")
+    scheduler = _scheduler(monkeypatch)
+    replica = SimpleNamespace(
+        whole_cohort_capacity=4,
+        whole_cohort_progress_snapshot=scheduler.whole_cohort_progress_snapshot,
+    )
+    serving = object.__new__(ServingRealtimeRobotOpenPI)
+    serving._whole_cohort_replica = lambda: replica
+    serving._process_generation = "generation"
+
+    initial = serving.progress_handshake()
+    assert initial["initial"]["sequence"] == 1
+    assert initial["initial"]["observed_ns"] > 0
+    assert initial["initial"]["admission_pending_ids"] == []
+    assert initial["initial"]["progress_scope"] is None
+    assert initial["initial"]["state"] == "idle"
 
 
 def test_reply_only_scheduler_rejects_shared_entry_and_fences_ambiguous_owner(monkeypatch):
@@ -209,7 +259,7 @@ def test_reply_only_scheduler_rejects_shared_entry_and_fences_ambiguous_owner(mo
 
 
 def test_progress_poll_returns_terminal_instead_of_late_progress():
-    async def infer(cohort_id, members, *, owner_id=None, progress=False):
+    async def infer(cohort_id, members, *, owner_id=None, progress_scope=None):
         await asyncio.sleep(0)
         return [{"actions": [1.0]}, {"actions": [2.0]}]
 
@@ -220,6 +270,7 @@ def test_progress_poll_returns_terminal_instead_of_late_progress():
         "instance_id": "instance",
         "generation": "generation",
         "cohort_id": "c",
+        "progress_scope": "scope-a",
         "poll_sequence": 1,
     }
 
@@ -231,8 +282,11 @@ def test_progress_poll_returns_terminal_instead_of_late_progress():
         raise AssertionError("server waited for a poll after terminal")
 
     connection = object.__new__(RobotRealtimeConnection)
+    connection._progress_scope = None
+    connection._last_progress_poll_sequence = -1
     connection.serving = SimpleNamespace(
         _process_generation="generation",
+        _valid_progress_scope=ServingRealtimeRobotOpenPI._valid_progress_scope,
         infer_whole_cohort=infer,
         whole_cohort_progress=Mock(),
         complete_reply_only_cohort=Mock(),
@@ -246,7 +300,9 @@ def test_progress_poll_returns_terminal_instead_of_late_progress():
     old_instance = os.environ.get("VLLM_OMNI_STATUS_INSTANCE")
     os.environ["VLLM_OMNI_STATUS_INSTANCE"] = "instance"
     try:
-        assert asyncio.run(connection._infer_whole_cohort({"cohort_id": "c", "members": _members(), "progress": True}))
+        assert asyncio.run(
+            connection._infer_whole_cohort({"cohort_id": "c", "members": _members(), "progress_scope": "scope-a"})
+        )
     finally:
         if old_instance is None:
             os.environ.pop("VLLM_OMNI_STATUS_INSTANCE", None)
@@ -262,7 +318,7 @@ async def test_progress_exchange_has_one_frame_per_poll_and_terminal(monkeypatch
     inference_done = asyncio.Event()
     polls = [1, 2]
 
-    async def infer(cohort_id, members, *, owner_id=None, progress=False):
+    async def infer(cohort_id, members, *, owner_id=None, progress_scope=None):
         await inference_done.wait()
         return [{"actions": [1.0]}, {"actions": [2.0]}]
 
@@ -277,37 +333,42 @@ async def test_progress_exchange_has_one_frame_per_poll_and_terminal(monkeypatch
                     "instance_id": "instance",
                     "generation": "generation",
                     "cohort_id": "c",
+                    "progress_scope": "scope-a",
                     "poll_sequence": sequence,
                 }
             ),
         }
 
     progress = Mock(
-        side_effect=lambda cohort_id, sequence, pending_ids: (
+        side_effect=lambda cohort_id, sequence, progress_scope, pending_ids: (
             inference_done.set()
             or {
                 "type": "progress",
                 "cohort_id": cohort_id,
+                "progress_scope": "scope-a",
                 "poll_sequence": sequence,
                 "state": "running",
             }
         )
     )
     connection = object.__new__(RobotRealtimeConnection)
+    connection._progress_scope = None
+    connection._last_progress_poll_sequence = -1
     connection.serving = SimpleNamespace(
         _process_generation="generation",
+        _valid_progress_scope=ServingRealtimeRobotOpenPI._valid_progress_scope,
         infer_whole_cohort=infer,
         whole_cohort_progress=progress,
         complete_reply_only_cohort=Mock(),
     )
     connection.websocket = SimpleNamespace(receive=receive, send_bytes=AsyncMock())
 
-    assert await connection._infer_whole_cohort({"cohort_id": "c", "members": _members(), "progress": True})
+    assert await connection._infer_whole_cohort({"cohort_id": "c", "members": _members(), "progress_scope": "scope-a"})
     frames = [_unpack(args.args[0]) for args in connection.websocket.send_bytes.await_args_list]
     assert [frame.get("type", "terminal") for frame in frames] == ["progress", "terminal"]
     assert frames[0]["poll_sequence"] == 1
     assert frames[1]["cohort_id"] == "c"
-    progress.assert_called_once_with("c", 1, ["r-a", "r-b"])
+    progress.assert_called_once_with("c", 1, "scope-a", ["r-a", "r-b"])
 
 
 def test_progress_uses_admitting_state_until_scheduler_enqueue(monkeypatch):
@@ -332,11 +393,24 @@ def test_progress_uses_admitting_state_until_scheduler_enqueue(monkeypatch):
     serving._whole_cohort_replica = lambda: replica
     serving._process_generation = "generation"
 
-    reply = serving.whole_cohort_progress("cohort-a", 7, ["request-a", "request-b"])
+    reply = serving.whole_cohort_progress("cohort-a", 7, "group-a", ["request-a", "request-b"])
     assert reply["type"] == "progress"
     assert reply["state"] == "admitting"
     assert reply["cohort_id"] == "cohort-a"
     assert reply["poll_sequence"] == 7
+    assert reply["progress_scope"] == "group-a"
     assert reply["active_ids"] == []
     assert reply["queued_ids"] == []
     assert reply["admission_pending_ids"] == ["request-a", "request-b"]
+
+
+def test_reply_only_allows_only_idle_dummy_warmup_without_cohort_schema(monkeypatch):
+    monkeypatch.setenv("VLLM_OMNI_OPENPI_REPLY_ONLY_EXCLUSIVE", "1")
+    monkeypatch.delenv("VLLM_OMNI_COHORT_SCHEMA", raising=False)
+    scheduler = _scheduler(monkeypatch)
+    dummy = _request(DUMMY_DIFFUSION_REQUEST_ID)
+    assert scheduler.add_startup_warmup(dummy) == DUMMY_DIFFUSION_REQUEST_ID
+    with pytest.raises(ValueError, match="without an owner"):
+        scheduler.add_request(_request("ordinary"))
+    with pytest.raises(ValueError, match="dummy request and an idle scheduler"):
+        scheduler.add_startup_warmup(_request("other-dummy"))

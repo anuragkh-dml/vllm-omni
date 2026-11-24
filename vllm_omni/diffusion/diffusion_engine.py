@@ -1493,6 +1493,7 @@ class DiffusionEngine:
         *,
         cohort_id: str | None = None,
         reply_only_owner: str | None = None,
+        progress_scope: str | None = None,
     ) -> list[OmniRequestOutput | BaseException]:
         """Admit one complete nonstreaming request wave on the engine's owner loop."""
         scheduler = self.scheduler
@@ -1513,7 +1514,12 @@ class DiffusionEngine:
                     for request in prepared:
                         request.cancellation_signal = self._request_cancellations.create(request.request_id)
                         registered.append(request.request_id)
-                ids = scheduler.add_whole_cohort(prepared, cohort_id=cohort_id, reply_only_owner=reply_only_owner)
+                ids = scheduler.add_whole_cohort(
+                    prepared,
+                    cohort_id=cohort_id,
+                    reply_only_owner=reply_only_owner,
+                    progress_scope=progress_scope,
+                )
             except BaseException:
                 if self._request_cancellations is not None:
                     for rid in registered:

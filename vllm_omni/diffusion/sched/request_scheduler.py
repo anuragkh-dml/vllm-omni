@@ -104,8 +104,10 @@ class RequestScheduler(BaseScheduler):
         self._whole_cohorts: dict[str, tuple[str, ...]] = {}
         self._whole_progress: dict[str, dict[str, object]] = {}
         self._whole_cohort_members: dict[str, tuple[str, ...]] = {}
+        self._whole_cohort_scopes: dict[str, str | None] = {}
+        self._whole_request_scopes: dict[str, str | None] = {}
         self._whole_request_scheduled_ns: dict[str, int] = {}
-        self._whole_progress_sequence = 0
+        self._whole_progress_sequence = 1 if os.environ.get("VLLM_OMNI_OPENPI_PROGRESS") == "1" else 0
         self._whole_progress_lock = threading.Lock()
         self._whole_completion_events: OrderedDict[str, dict[str, object]] = OrderedDict()
         self._whole_progress_enabled = os.environ.get("VLLM_OMNI_OPENPI_PROGRESS") == "1"
@@ -126,9 +128,10 @@ class RequestScheduler(BaseScheduler):
         with self._whole_progress_lock:
             self._whole_progress.clear()
             self._whole_cohort_members.clear()
+            self._whole_cohort_scopes.clear()
+            self._whole_request_scopes.clear()
             self._whole_request_scheduled_ns.clear()
             self._whole_completion_events.clear()
-            self._whole_progress_sequence = 0
         # A normal OpenPI reset is not a process restart. Preserve the dedicated
         # owner fence, and fence any lease whose in-flight request was reset.
         if self._reply_only_required and self._reply_only_cohort is not None:
@@ -139,6 +142,7 @@ class RequestScheduler(BaseScheduler):
         self._request_cohort.pop(request_id, None)
         self._cohort_queue_enter_ns.pop(request_id, None)
         self._whole_cohorts.pop(request_id, None)
+        self._whole_request_scopes.pop(request_id, None)
         self._whole_request_scheduled_ns.pop(request_id, None)
 
     def add_whole_cohort(
@@ -147,6 +151,7 @@ class RequestScheduler(BaseScheduler):
         *,
         cohort_id: str | None = None,
         reply_only_owner: str | None = None,
+        progress_scope: str | None = None,
     ) -> tuple[str, ...]:
         """Validate every member before making the ready group visible to scheduling."""
         ids = tuple(request.request_id for request in requests)
@@ -162,10 +167,35 @@ class RequestScheduler(BaseScheduler):
             or len(set(ids)) != len(ids)
             or not isinstance(cohort_id, str)
             or not cohort_id
+            or (self._whole_progress_enabled and cohort_id in self._whole_cohort_members)
             or any(rid in self._request_states or rid in self._kv_draining_requests for rid in ids)
             or self._diffusion_kv_manager is not None
         ):
             raise ValueError("invalid whole-cohort size, identity or scheduler mode")
+        if self._whole_progress_enabled and (
+            not isinstance(progress_scope, str)
+            or not 1 <= len(progress_scope) <= 128
+            or any(
+                char not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._:-"
+                for char in progress_scope
+            )
+        ):
+            raise ValueError("progress-enabled whole cohort requires a valid progress scope")
+        if self._whole_progress_enabled and len(self._whole_cohort_members) >= 1024:
+            active_ids = set(self._running) | set(self._waiting)
+            stale_id = next(
+                (
+                    old_id
+                    for old_id, old_members in self._whole_cohort_members.items()
+                    if not active_ids.intersection(old_members)
+                ),
+                None,
+            )
+            if stale_id is None:
+                raise ValueError("whole-cohort progress registry is full")
+            self._whole_cohort_members.pop(stale_id, None)
+            self._whole_cohort_scopes.pop(stale_id, None)
+            self._whole_progress.pop(stale_id, None)
         states = [self._make_request_state(rid, req) for rid, req in zip(ids, requests, strict=True)]
         if any(state.sampling_params_key != states[0].sampling_params_key for state in states[1:]):
             raise ValueError("whole cohort has incompatible sampling parameters")
@@ -198,78 +228,84 @@ class RequestScheduler(BaseScheduler):
         self._waiting.extend(ids)
         if self._whole_progress_enabled:
             self._whole_cohort_members[cohort_id] = ids
+            self._whole_cohort_scopes[cohort_id] = progress_scope
+            for rid in ids:
+                self._whole_request_scopes[rid] = progress_scope
             self._record_whole_cohort_progress(cohort_id)
         self._publish_benchmark_progress()
         return ids
 
-    def whole_cohort_progress(self, cohort_id: str) -> dict[str, object]:
-        """Return a fresh, causally correlated snapshot for one whole cohort."""
+    def whole_cohort_progress(self, cohort_id: str, progress_scope: str) -> dict[str, object]:
+        """Return a fresh snapshot for one cohort within its admission-group scope."""
         if not self._whole_progress_enabled:
             raise RuntimeError("whole-cohort progress is not enabled")
         with self._whole_progress_lock:
             if cohort_id not in self._whole_cohort_members:
                 raise KeyError("unknown whole cohort")
-        return self._build_whole_cohort_progress_snapshot(cohort_id)
+            if self._whole_cohort_scopes.get(cohort_id) != progress_scope:
+                raise ValueError("progress scope does not own this whole cohort")
+        return self._build_whole_cohort_progress_snapshot(cohort_id, progress_scope)
 
-    def whole_cohort_progress_snapshot(self) -> dict[str, object]:
-        """Return current replica activity without exposing other cohort IDs."""
+    def whole_cohort_progress_snapshot(self, progress_scope: str | None = None) -> dict[str, object]:
+        """Return replica activity, exposing exact IDs only within a supplied scope."""
         if not self._whole_progress_enabled:
             raise RuntimeError("whole-cohort progress is not enabled")
-        return self._build_whole_cohort_progress_snapshot(None)
+        return self._build_whole_cohort_progress_snapshot(None, progress_scope)
 
-    def _build_whole_cohort_progress_snapshot(self, cohort_id: str | None) -> dict[str, object]:
-        # Callers hold the engine condition lock so scheduler collections and the
-        # forward marker form one projection. Preserve queue order: the estimator
-        # uses positions to reason about work ahead of the requested cohort.
+    def _build_whole_cohort_progress_snapshot(
+        self, cohort_id: str | None, progress_scope: str | None
+    ) -> dict[str, object]:
+        # Callers hold the engine condition lock. Scheduler-selected work that
+        # has not entered a forward is queue-head work, not active model work.
         running = tuple(self._running)
         waiting = tuple(self._waiting)
         if len(running) + len(waiting) > _MAX_WHOLE_PROGRESS_REQUESTS:
             raise ValueError("whole-cohort progress snapshot exceeds request bound")
         forward = getattr(self, "_benchmark_active_forward", None)
         forward_ids = set(forward.get("internal_request_ids", ())) if forward else set()
-        members = set(self._whole_cohort_members.get(cohort_id, ())) if cohort_id else set()
+        active_internal = tuple(rid for rid in running if rid in forward_ids)
+        scheduled_internal = tuple(rid for rid in running if rid not in forward_ids)
+        queued_internal = (*scheduled_internal, *waiting)
+        scoped_members = {
+            rid
+            for rid, scope in self._whole_request_scopes.items()
+            if progress_scope is not None and scope == progress_scope
+        }
         now_ns = time.monotonic_ns()
         active_ids = [
-            self._benchmark_progress_id(rid) if rid in members else self._opaque_progress_id(rid) for rid in running
+            self._benchmark_progress_id(rid) if rid in scoped_members else self._opaque_progress_id(rid)
+            for rid in active_internal
         ]
         queued_ids = [
-            self._benchmark_progress_id(rid) if rid in members else self._opaque_progress_id(rid) for rid in waiting
+            self._benchmark_progress_id(rid) if rid in scoped_members else self._opaque_progress_id(rid)
+            for rid in queued_internal
         ]
         if cohort_id is None:
-            state = "running" if forward else "scheduled" if running else "queued" if waiting else "idle"
-        elif forward and members.intersection(forward_ids):
+            state = "running" if forward else "scheduled" if scheduled_internal else "queued" if waiting else "idle"
+        elif forward and scoped_members.intersection(forward_ids):
             state = "running"
-        elif members.intersection(running):
+        elif scoped_members.intersection(scheduled_internal):
             state = "scheduled"
-        elif members.intersection(waiting):
+        elif scoped_members.intersection(waiting):
             state = "queued"
         else:
             state = "finished"
 
-        if forward:
-            active_start_age_ns = max(0, now_ns - int(forward["start_ns"]))
-        else:
-            scheduled = [
-                self._whole_request_scheduled_ns[rid] for rid in running if rid in self._whole_request_scheduled_ns
-            ]
-            active_start_age_ns = max(0, now_ns - min(scheduled)) if scheduled else None
-
-        active_groups = {self._whole_cohorts[rid] for rid in running if rid in self._whole_cohorts}
-        queued_groups = {self._whole_cohorts[rid] for rid in waiting if rid in self._whole_cohorts}
-        external_active = [rid for rid in running if rid not in members]
-        external_queued = [rid for rid in waiting if rid not in members]
+        active_start_age_ns = max(0, now_ns - int(forward["start_ns"])) if forward else None
+        active_groups = {self._whole_cohorts[rid] for rid in active_internal if rid in self._whole_cohorts}
+        queued_groups = {self._whole_cohorts[rid] for rid in queued_internal if rid in self._whole_cohorts}
+        external_active = [rid for rid in active_internal if rid not in scoped_members]
+        external_queued = [rid for rid in queued_internal if rid not in scoped_members]
         completions = []
         for forward_id, event in self._whole_completion_events.items():
             completion_ids = event["request_ids"]
-            is_owned_completion = bool(
-                cohort_id is not None and members.intersection(event.get("internal_request_ids", ()))
-            )
+            is_scoped_completion = progress_scope is not None and event.get("progress_scope") == progress_scope
             completions.append(
                 {
                     "forward_id": forward_id,
                     "request_ids": (
                         list(completion_ids)
-                        if is_owned_completion
+                        if is_scoped_completion
                         else [self._opaque_progress_id(rid) for rid in completion_ids]
                     ),
                     "age_ns": max(0, now_ns - int(event["ended_ns"])),
@@ -277,17 +313,19 @@ class RequestScheduler(BaseScheduler):
             )
         return {
             "cohort_id": cohort_id,
+            "progress_scope": progress_scope,
             "state": state,
-            "active_forward_id": forward.get("forward_id") if forward else None,
+            "active_forward_id": forward.get("forward_id") if active_internal and forward else None,
             "active_ids": active_ids,
             "queued_ids": queued_ids,
-            "active_start_age_ns": active_start_age_ns,
+            "active_start_age_ns": active_start_age_ns if active_internal else None,
             "active_cohort_count": len(active_groups),
             "queued_cohort_count": len(queued_groups),
             "external_active_count": len(external_active),
             "external_queued_count": len(external_queued),
             "external_active_ids": [self._opaque_progress_id(rid) for rid in external_active],
             "external_queued_ids": [self._opaque_progress_id(rid) for rid in external_queued],
+            "admission_pending_ids": [],
             "recent_completions": completions[-32:],
             "sequence": self._whole_progress_sequence,
             "observed_ns": now_ns,
@@ -331,7 +369,9 @@ class RequestScheduler(BaseScheduler):
         # This function is called under the engine condition lock. Store only a
         # compact transition projection; each poll takes a fresh timestamp and
         # age projection without advancing the event sequence.
-        snapshot = self._build_whole_cohort_progress_snapshot(changed_cohort_id)
+        snapshot = self._build_whole_cohort_progress_snapshot(
+            changed_cohort_id, self._whole_cohort_scopes.get(changed_cohort_id)
+        )
         comparable = {key: value for key, value in snapshot.items() if key not in {"observed_ns", "sequence"}}
         with self._whole_progress_lock:
             previous = self._whole_progress.get(changed_cohort_id)
@@ -343,11 +383,6 @@ class RequestScheduler(BaseScheduler):
                 "sequence": self._whole_progress_sequence,
                 "observed_ns": time.monotonic_ns(),
             }
-            if len(self._whole_progress) > 1024:
-                oldest = next(iter(self._whole_progress))
-                if oldest != changed_cohort_id:
-                    self._whole_progress.pop(oldest, None)
-                    self._whole_cohort_members.pop(oldest, None)
 
     def _opaque_progress_id(self, request_id: str) -> str:
         digest = hmac.new(self._whole_progress_salt, request_id.encode(), hashlib.sha256).hexdigest()
@@ -364,16 +399,13 @@ class RequestScheduler(BaseScheduler):
     def benchmark_forward_end(self) -> None:
         forward = getattr(self, "_benchmark_active_forward", None)
         if forward is not None:
-            cohort_ids = {
-                str((self._request_states[rid].req.sampling_params.extra_args or {}).get("whole_cohort_id"))
-                for rid in forward.get("internal_request_ids", ())
-                if rid in self._request_states
-                and (self._request_states[rid].req.sampling_params.extra_args or {}).get("whole_cohort_id")
-            }
+            request_ids = tuple(forward.get("internal_request_ids", ()))
+            scopes = {self._whole_request_scopes.get(rid) for rid in request_ids}
+            progress_scope = next(iter(scopes)) if len(scopes) == 1 else None
             self._whole_completion_events[str(forward["forward_id"])] = {
                 "request_ids": tuple(forward.get("request_ids", ())),
-                "internal_request_ids": tuple(forward.get("internal_request_ids", ())),
-                "cohort_ids": tuple(sorted(cohort_ids)),
+                "internal_request_ids": request_ids,
+                "progress_scope": progress_scope,
                 "ended_ns": time.monotonic_ns(),
             }
             while len(self._whole_completion_events) > 64:
@@ -395,6 +427,12 @@ class RequestScheduler(BaseScheduler):
 
     def add_startup_warmup(self, request: OmniDiffusionRequest) -> str:
         """Admit the engine's own dummy request before serving begins."""
+        if self._reply_only_required:
+            if not request.is_dummy_run() or self.has_requests():
+                raise ValueError("startup warmup requires a dummy request and an idle scheduler")
+            # Exclusive serving rejects every ordinary entry point. This one
+            # startup-only dummy bypass is safe only before any work exists.
+            return super()._add_request_with_request_id(request.request_id, request)
         if self._cohort_schema != COHORT_ELAPSED_SCHEMA:
             return self.add_request(request)
         if not request.is_dummy_run() or self.has_requests():

@@ -33,6 +33,8 @@ WHOLE_COHORT_SCHEMA = "vllm_omni.infer_cohort.v1"
 WHOLE_COHORT_PROGRESS_SCHEMA = "vllm_omni.infer_cohort_progress.v1"
 REPLY_ONLY_SCHEMA = "vllm_omni.reply_only.v1"
 MAX_COHORT_SESSIONS = 1024
+MAX_PROGRESS_SCOPE_LENGTH = 128
+_PROGRESS_SCOPE_CHARACTERS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._:-")
 
 
 def _to_builtin_container(value: Any) -> Any:
@@ -148,16 +150,19 @@ class ServingRealtimeRobotOpenPI:
         self,
         cohort_id: str | None,
         poll_sequence: int,
+        progress_scope: str,
         admission_pending_ids: list[str] | None = None,
     ) -> dict[str, object]:
         if not self.progress_capability:
             raise ValueError("in-band OpenPI progress is unavailable")
+        if not self._valid_progress_scope(progress_scope):
+            raise ValueError("invalid OpenPI progress scope")
         replica = self._whole_cohort_replica()
         try:
             snapshot = (
-                replica.whole_cohort_progress_snapshot()
+                replica.whole_cohort_progress_snapshot(progress_scope)
                 if cohort_id is None
-                else replica.whole_cohort_progress(cohort_id)
+                else replica.whole_cohort_progress(cohort_id, progress_scope)
             )
         except KeyError:
             if cohort_id is None or admission_pending_ids is None:
@@ -167,13 +172,14 @@ class ServingRealtimeRobotOpenPI:
                     "instance_id": os.environ["VLLM_OMNI_STATUS_INSTANCE"],
                     "generation": self._process_generation,
                     "cohort_id": cohort_id,
+                    "progress_scope": progress_scope,
                     "poll_sequence": poll_sequence,
                     "reason": "unknown_cohort",
                 }
             # The poll may overtake request conversion and scheduler admission.
             # Report that explicit phase with the actual global scheduler view;
             # do not pretend the pending IDs are already queued at the backend.
-            snapshot = replica.whole_cohort_progress_snapshot()
+            snapshot = replica.whole_cohort_progress_snapshot(progress_scope)
             snapshot["cohort_id"] = cohort_id
             snapshot["state"] = "admitting"
             snapshot["admission_pending_ids"] = admission_pending_ids
@@ -184,9 +190,19 @@ class ServingRealtimeRobotOpenPI:
             "instance_id": os.environ["VLLM_OMNI_STATUS_INSTANCE"],
             "generation": self._process_generation,
             "cohort_id": cohort_id,
+            "progress_scope": progress_scope,
             "poll_sequence": poll_sequence,
             **snapshot,
         }
+
+    @staticmethod
+    def _valid_progress_scope(progress_scope: object) -> bool:
+        return (
+            isinstance(progress_scope, str)
+            and 1 <= len(progress_scope) <= MAX_PROGRESS_SCOPE_LENGTH
+            and progress_scope.isascii()
+            and all(char in _PROGRESS_SCOPE_CHARACTERS for char in progress_scope)
+        )
 
     def reply_only_handshake(self) -> dict[str, object] | None:
         instance = os.environ.get("VLLM_OMNI_OPENPI_REPLY_ONLY_INSTANCE")
@@ -218,15 +234,18 @@ class ServingRealtimeRobotOpenPI:
         members: list[dict],
         *,
         owner_id: str | None = None,
-        progress: bool = False,
+        progress_scope: str | None = None,
     ) -> list[ActionOutput | None]:
         replica = self._whole_cohort_replica()
         if replica is None or not 1 <= len(members) <= self.whole_cohort_capacity:
             raise ValueError("whole-cohort inference is unavailable or beyond replica capacity")
         if not isinstance(cohort_id, str) or not 1 <= len(cohort_id) <= 256:
             raise ValueError("invalid whole-cohort identity")
-        if progress and not self.progress_capability:
-            raise ValueError("whole-cohort progress was requested without negotiated capability")
+        if (self.progress_capability and progress_scope is None) or (
+            progress_scope is not None
+            and (not self._valid_progress_scope(progress_scope) or not self.progress_capability)
+        ):
+            raise ValueError("whole-cohort progress scope was not negotiated or is invalid")
         if owner_id is None and self.reply_only_handshake() is not None:
             raise ValueError("dedicated reply-only inference requires an owner lease")
         requests = []
@@ -275,7 +294,12 @@ class ServingRealtimeRobotOpenPI:
         try:
             results = await asyncio.wrap_future(
                 asyncio.run_coroutine_threadsafe(
-                    replica.infer_whole_cohort(requests, cohort_id=cohort_id, reply_only_owner=owner_id),
+                    replica.infer_whole_cohort(
+                        requests,
+                        cohort_id=cohort_id,
+                        reply_only_owner=owner_id,
+                        progress_scope=progress_scope,
+                    ),
                     engine.orchestrator_loop,
                 )
             )

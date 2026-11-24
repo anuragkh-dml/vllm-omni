@@ -180,6 +180,8 @@ class RobotRealtimeConnection:
         self._current_session_id: str | None = None
         # Session ids seen on this connection, most-recently-used last.
         self._seen_sessions: OrderedDict[str, None] = OrderedDict()
+        self._progress_scope: str | None = None
+        self._last_progress_poll_sequence = -1
 
     def reset(self) -> None:
         self._current_session_id = None
@@ -218,22 +220,32 @@ class RobotRealtimeConnection:
 
     async def _infer_whole_cohort(self, obs: dict) -> bool:
         owner_id = obs.get("owner_id")
-        progress = obs.get("progress", False)
+        progress_scope = obs.get("progress_scope")
+        progress = progress_scope is not None
         allowed = {"cohort_id", "members"}
         if "owner_id" in obs:
             allowed.add("owner_id")
-        if "progress" in obs:
-            allowed.add("progress")
+        if "progress_scope" in obs:
+            allowed.add("progress_scope")
         if (
             obs.keys() != allowed
             or not isinstance(obs.get("members"), list)
-            or type(progress) is not bool
             or ("owner_id" in obs and (not isinstance(owner_id, str) or not owner_id))
+            or ("progress_scope" in obs and not self.serving._valid_progress_scope(progress_scope))
         ):
             raise ValueError("invalid whole-cohort envelope")
         cohort_id, members = obs["cohort_id"], obs["members"]
+        if progress:
+            try:
+                self._bind_progress_scope(progress_scope)
+            except ValueError:
+                await self.websocket.close(code=1008)
+                return False
+        elif self._progress_scope is not None:
+            await self.websocket.close(code=1008)
+            return False
         inference = asyncio.create_task(
-            self.serving.infer_whole_cohort(cohort_id, members, owner_id=owner_id, progress=progress)
+            self.serving.infer_whole_cohort(cohort_id, members, owner_id=owner_id, progress_scope=progress_scope)
         )
         incoming = None
         terminal_sent = False
@@ -247,12 +259,12 @@ class RobotRealtimeConnection:
                         # prevents an unsolicited progress frame from remaining
                         # queued after the inference result.
                         message = await incoming
-                        self._validate_cohort_progress_poll(message, cohort_id)
+                        self._validate_cohort_progress_poll(message, cohort_id, progress_scope)
                         break
                     finished, _ = await asyncio.wait((inference, incoming), return_when=asyncio.FIRST_COMPLETED)
                     if incoming in finished:
                         message = incoming.result()
-                        self._validate_cohort_progress_poll(message, cohort_id)
+                        self._validate_cohort_progress_poll(message, cohort_id, progress_scope)
                         if inference.done():
                             break
                         poll = self._unpack_request(message["bytes"])
@@ -264,7 +276,7 @@ class RobotRealtimeConnection:
                         ):
                             raise ValueError("invalid whole-cohort request IDs")
                         progress_reply = self.serving.whole_cohort_progress(
-                            cohort_id, poll["poll_sequence"], request_ids
+                            cohort_id, poll["poll_sequence"], progress_scope, request_ids
                         )
                         await self.websocket.send_bytes(_pack(progress_reply))
                         incoming = asyncio.create_task(self.websocket.receive())
@@ -314,23 +326,40 @@ class RobotRealtimeConnection:
             if owner_id is not None and not terminal_sent:
                 self.serving.complete_reply_only_cohort(cohort_id, owner_id, terminal_received=False)
 
-    def _validate_cohort_progress_poll(self, message: dict, cohort_id: str) -> None:
+    def _bind_progress_scope(self, progress_scope: str) -> None:
+        if self._progress_scope is None:
+            self._progress_scope = progress_scope
+        elif self._progress_scope != progress_scope:
+            raise ValueError("OpenPI connection cannot change progress scope")
+
+    def _validate_cohort_progress_poll(self, message: dict, cohort_id: str, progress_scope: str) -> None:
         if message.get("type") == "websocket.disconnect":
             raise WebSocketDisconnect()
         if "bytes" not in message or not message["bytes"]:
             raise ValueError("empty progress poll")
         poll = self._unpack_request(message["bytes"])
         if (
-            poll.keys() != {"type", "schema", "instance_id", "generation", "cohort_id", "poll_sequence"}
+            poll.keys()
+            != {"type", "schema", "instance_id", "generation", "cohort_id", "progress_scope", "poll_sequence"}
             or poll.get("type") != "progress_poll"
             or poll.get("schema") != WHOLE_COHORT_PROGRESS_SCHEMA
             or poll.get("instance_id") != os.environ.get("VLLM_OMNI_STATUS_INSTANCE")
             or poll.get("generation") != self.serving._process_generation
             or poll.get("cohort_id") != cohort_id
+            or poll.get("progress_scope") != progress_scope
+            or not self.serving._valid_progress_scope(poll.get("progress_scope"))
+            or not isinstance(poll.get("cohort_id"), str)
+            or not 1 <= len(poll["cohort_id"]) <= 256
             or type(poll.get("poll_sequence")) is not int
-            or not 0 <= poll["poll_sequence"] < 2**63
+            or not self._accept_progress_poll_sequence(poll["poll_sequence"])
         ):
-            raise ValueError("uncorrelated progress poll")
+            raise WebSocketDisconnect()
+
+    def _accept_progress_poll_sequence(self, sequence: object) -> bool:
+        if type(sequence) is not int or not self._last_progress_poll_sequence < sequence < 2**63:
+            return False
+        self._last_progress_poll_sequence = sequence
+        return True
 
     async def handle_connection(self) -> None:
         """Main loop for OpenPI-compatible policy serving."""
@@ -399,19 +428,40 @@ class RobotRealtimeConnection:
                     if obs.get("type") == "progress_poll":
                         poll = obs
                         if (
-                            poll.keys() != {"type", "schema", "instance_id", "generation", "cohort_id", "poll_sequence"}
+                            poll.keys()
+                            != {
+                                "type",
+                                "schema",
+                                "instance_id",
+                                "generation",
+                                "cohort_id",
+                                "progress_scope",
+                                "poll_sequence",
+                            }
                             or poll.get("schema") != WHOLE_COHORT_PROGRESS_SCHEMA
                             or poll.get("instance_id") != os.environ.get("VLLM_OMNI_STATUS_INSTANCE")
                             or poll.get("generation") != self.serving._process_generation
                             or poll.get("type") != "progress_poll"
-                            or (poll.get("cohort_id") is not None and not isinstance(poll.get("cohort_id"), str))
+                            or (
+                                poll.get("cohort_id") is not None
+                                and (
+                                    not isinstance(poll.get("cohort_id"), str) or not 1 <= len(poll["cohort_id"]) <= 256
+                                )
+                            )
+                            or not self.serving._valid_progress_scope(poll.get("progress_scope"))
+                            or (self._progress_scope is not None and poll.get("progress_scope") != self._progress_scope)
                             or type(poll.get("poll_sequence")) is not int
-                            or not 0 <= poll["poll_sequence"] < 2**63
+                            or not self._accept_progress_poll_sequence(poll["poll_sequence"])
                         ):
                             await self.websocket.close(code=1008)
                             return
+                        self._bind_progress_scope(poll["progress_scope"])
                         await self.websocket.send_bytes(
-                            _pack(self.serving.whole_cohort_progress(poll["cohort_id"], poll["poll_sequence"]))
+                            _pack(
+                                self.serving.whole_cohort_progress(
+                                    poll["cohort_id"], poll["poll_sequence"], poll["progress_scope"]
+                                )
+                            )
                         )
                         continue
                     endpoint = obs.pop("endpoint", "infer")

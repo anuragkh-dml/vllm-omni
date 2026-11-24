@@ -125,18 +125,24 @@ class InlineStageDiffusionClient(StageClientBase):
         *,
         cohort_id: str | None = None,
         reply_only_owner: str | None = None,
+        progress_scope: str | None = None,
     ) -> list[OmniRequestOutput | BaseException]:
         if not 1 <= len(requests) <= self.whole_cohort_capacity or self._shutting_down or self._engine_dead:
             raise ValueError("whole-cohort replica unavailable or incompatible")
-        return await self._engine.infer_whole_cohort(requests, cohort_id=cohort_id, reply_only_owner=reply_only_owner)
+        return await self._engine.infer_whole_cohort(
+            requests,
+            cohort_id=cohort_id,
+            reply_only_owner=reply_only_owner,
+            progress_scope=progress_scope,
+        )
 
-    def whole_cohort_progress(self, cohort_id: str) -> dict[str, object]:
+    def whole_cohort_progress(self, cohort_id: str, progress_scope: str) -> dict[str, object]:
         with self._engine._cv:
-            return self._engine.scheduler.whole_cohort_progress(cohort_id)
+            return self._engine.scheduler.whole_cohort_progress(cohort_id, progress_scope)
 
-    def whole_cohort_progress_snapshot(self) -> dict[str, object]:
+    def whole_cohort_progress_snapshot(self, progress_scope: str | None = None) -> dict[str, object]:
         with self._engine._cv:
-            return self._engine.scheduler.whole_cohort_progress_snapshot()
+            return self._engine.scheduler.whole_cohort_progress_snapshot(progress_scope)
 
     def reply_only_is_idle(self) -> bool:
         with self._engine._cv:
