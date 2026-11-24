@@ -70,7 +70,9 @@ class BaseScheduler(ABC):
         self.od_config: OmniDiffusionConfig | None = None
         self._request_states: dict[str, SchedulerRequestState] = {}
         progress_path = os.environ.get("VLLM_OMNI_BENCH_STATUS_PATH")
-        self._benchmark_progress = ProgressFeed(progress_path) if progress_path else None
+        self._benchmark_progress = (
+            ProgressFeed(progress_path) if progress_path or os.environ.get("VLLM_OMNI_STATUS_PORT") else None
+        )
         self._benchmark_active_forward: dict[str, object] | None = None
         self._step_id: int = 0
         self._waiting: deque[str] = deque()

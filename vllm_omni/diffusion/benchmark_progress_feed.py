@@ -3,8 +3,8 @@
 
 """Optional host-monotonic scheduler status for benchmark admission.
 
-Enabled only when VLLM_OMNI_BENCH_STATUS_PATH names a writable local file.
-The scheduler only replaces an in-memory state; file I/O runs in a daemon.
+A file publisher and authenticated network publisher can sample the same state.
+The scheduler updates in-memory state only.
 """
 
 from __future__ import annotations
@@ -17,14 +17,16 @@ import time
 from collections import deque
 from pathlib import Path
 
+from vllm_omni.diffusion.network_progress import NetworkProgressEndpoint
+
 SCHEDULER_FORWARD_START_NS_FIELD = "_vllm_omni_benchmark_scheduler_forward_start_ns"
 SCHEDULER_ACTIVE_TELEMETRY_MARKER = "BENCH_OMNI_SCHEDULER_ACTIVE "
 SCHEDULER_ACTIVE_TELEMETRY_SCHEMA = "vllm_omni.scheduler_active.v1"
 
 
 class ProgressFeed:
-    def __init__(self, path: str):
-        self.path = Path(path)
+    def __init__(self, path: str | None):
+        self.path = Path(path) if path else None
         self.hostname = socket.gethostname()
         self._lock = threading.Lock()
         self._active: dict | None = None
@@ -32,8 +34,15 @@ class ProgressFeed:
         self._events: deque[dict] = deque(maxlen=256)
         self._stop = threading.Event()
         self._wake = threading.Event()
-        self._thread = threading.Thread(target=self._run, name="omni-progress-feed", daemon=True)
-        self._thread.start()
+        self._endpoint = None
+        if port := os.environ.get("VLLM_OMNI_STATUS_PORT"):
+            self._endpoint = NetworkProgressEndpoint(
+                int(port), os.environ["VLLM_OMNI_STATUS_KEY"], os.environ["VLLM_OMNI_STATUS_INSTANCE"], self.snapshot
+            )
+        self._thread = None
+        if self.path is not None:
+            self._thread = threading.Thread(target=self._run, name="omni-progress-feed", daemon=True)
+            self._thread.start()
 
     def publish(self, active: dict | None, queued: tuple[str, ...]) -> None:
         with self._lock:
@@ -77,26 +86,25 @@ class ProgressFeed:
             self._events.append({"kind": "cohort_metadata_rejected", **details})
         self._wake.set()
 
-    def _run(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        while not self._stop.is_set():
-            with self._lock:
-                active = self._active
-                queued = self._queued
-                events = list(self._events)
-            observed_ns = time.monotonic_ns()
-            payload = {
+    def snapshot(self) -> dict:
+        with self._lock:
+            return {
                 "schema": "omni_scheduler_progress.v1",
                 "clock_domain": "host_monotonic_ns",
                 "hostname": self.hostname,
-                "observed_ns": observed_ns,
-                "active": active,
-                "queued_request_ids": queued,
-                "recent_events": events,
+                "observed_ns": time.monotonic_ns(),
+                "active": self._active,
+                "queued_request_ids": self._queued,
+                "recent_events": list(self._events),
             }
+
+    def _run(self) -> None:
+        assert self.path is not None
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        while not self._stop.is_set():
             temporary = self.path.with_name(self.path.name + f".{os.getpid()}.tmp")
             try:
-                temporary.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+                temporary.write_text(json.dumps(self.snapshot(), separators=(",", ":")), encoding="utf-8")
                 os.replace(temporary, self.path)
             except OSError:
                 # The reader will treat a missing or stale feed as a fallback.
@@ -107,4 +115,7 @@ class ProgressFeed:
     def close(self) -> None:
         self._stop.set()
         self._wake.set()
-        self._thread.join(timeout=1)
+        if self._thread is not None:
+            self._thread.join(timeout=1)
+        if self._endpoint is not None:
+            self._endpoint.close()
